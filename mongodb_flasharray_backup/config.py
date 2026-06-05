@@ -1,0 +1,770 @@
+###############################################################################################################################
+# Shared configuration for all mongodb-flasharray-backup scripts (Python port of Config.ps1).
+#
+# In PowerShell every script dot-sources Config.ps1 at its top:
+#   . "$PSScriptRoot/Config.ps1"
+# In Python the equivalent is: `from . import config` then `config.load_config()` at the start of each
+# command's main(). load_config() reads the .env file (throwing if it or a required key is missing),
+# exactly mirroring the side effects of dot-sourcing Config.ps1.
+#
+# All values are loaded from a .env file. Copy .env.example to .env and fill in your values before running
+# any script. The .env is located via $MONGO_FA_BACKUP_ENV, else python-dotenv's search from the CWD, else
+# ./.env (this is the Python analogue of Config.ps1's $PSScriptRoot/.env).
+#
+# Cluster topology and FlashArray volume mappings are discovered at runtime from authoritative sources
+# (Ops Manager API and FlashArray SCSI serial numbers). .env values are used only for credentials and as a
+# fallback when live discovery is unavailable.
+###############################################################################################################################
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import socket
+import subprocess
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
+
+import requests
+import typer
+from dotenv import find_dotenv
+
+# ---------------------------------------------------------------------------------------------------------
+# Write-Host color map. Translates PowerShell -ForegroundColor names to click/typer color names so the
+# operator-visible coloring is preserved (Cyan/Green/Yellow/DarkYellow/Red/DarkGray).
+# ---------------------------------------------------------------------------------------------------------
+CYAN = "cyan"
+GREEN = "green"
+YELLOW = "bright_yellow"       # PowerShell "Yellow" renders bright
+DARK_YELLOW = "yellow"         # PowerShell "DarkYellow" renders as plain (olive) yellow
+RED = "red"
+DARK_GRAY = "bright_black"
+
+
+def write_host(message: str, fg: Optional[str] = None) -> None:
+    """Equivalent of `Write-Host [-ForegroundColor <fg>]`."""
+    typer.secho(message, fg=fg)
+
+
+# region --- Load .env ---
+
+
+def _read_env_file(env_file: Path) -> dict[str, str]:
+    """Replicates Config.ps1's custom .env parser exactly:
+        Get-Content $EnvFile | Where-Object { $_ -match '^\\s*[^#\\s]' } | ForEach-Object {
+            $Parts = $_ -split '=', 2
+            if ($Parts.Count -eq 2) { $EnvVars[$Parts[0].Trim()] = $Parts[1].Trim() }
+        }
+    i.e. keep lines whose first non-whitespace char is neither '#' nor whitespace, split on the first '='
+    only, and trim both sides. No quote stripping or variable expansion (matching the original).
+    """
+    env_vars: dict[str, str] = {}
+    for line in env_file.read_text().splitlines():
+        if re.match(r"^\s*[^#\s]", line):
+            parts = line.split("=", 1)
+            if len(parts) == 2:
+                env_vars[parts[0].strip()] = parts[1].strip()
+    return env_vars
+
+
+def get_env_var(env_vars: dict[str, str], key: str, optional: bool = False) -> Optional[str]:
+    """Config.ps1: Get-EnvVar — returns value, or $null if -Optional, else throws."""
+    if key in env_vars:
+        return env_vars[key]
+    if optional:
+        return None
+    raise RuntimeError(f".env is missing required key: {key}")
+
+
+@dataclass
+class Config:
+    """Holds every value Config.ps1 derives from .env. Populated by load_config()."""
+
+    EnvVars: dict[str, str]
+    # MongoDB cluster topology
+    MongoshPath: str
+    MongosHost: str
+    MongosPort: int
+    SshUser: str
+    ClusterNodesFallback: Optional[list[str]]
+    # MongoDB database tools
+    MongoToolsBase: str
+    MongodumpPath: str
+    MongorestorePath: str
+    # Pure Storage FlashArray
+    FaEndpoint: str
+    FaUsername: str
+    FaPassword: str
+    ProtectionGroupName: str
+    ClusterName: str
+    # Ops Manager
+    OmHost: str
+    OmApiVersion: str
+    OpsManagerBaseUrl: str
+    GroupId: str
+    ClusterId: str
+    OmPublicKey: str
+    OmPrivateKey: str
+
+
+# Module-level config singleton. Mirrors Config.ps1's script-scope variables being available to all
+# functions after dot-sourcing. None until load_config() runs.
+CFG: Optional[Config] = None
+
+
+def _resolve_env_file(env_path: Optional[os.PathLike | str]) -> Path:
+    if env_path is not None:
+        return Path(env_path)
+    override = os.environ.get("MONGO_FA_BACKUP_ENV")
+    if override:
+        return Path(override)
+    found = find_dotenv(usecwd=True)
+    if found:
+        return Path(found)
+    return Path.cwd() / ".env"
+
+
+def load_config(env_path: Optional[os.PathLike | str] = None) -> Config:
+    """Python equivalent of dot-sourcing Config.ps1: load .env and populate CFG.
+
+    Throws if the .env file is missing or a required key is absent — exactly like Config.ps1.
+    """
+    global CFG
+    env_file = _resolve_env_file(env_path)
+    if not env_file.exists():
+        raise RuntimeError(
+            f".env file not found at '{env_file}'. Copy .env.example to .env and fill in your values."
+        )
+    env_vars = _read_env_file(env_file)
+
+    def g(key: str, optional: bool = False) -> Optional[str]:
+        return get_env_var(env_vars, key, optional)
+
+    # --- MongoDB cluster topology ---
+    mongosh_path = g("MONGOSH_PATH")
+    mongos_host = g("MONGOS_HOST")
+    mongos_port = int(g("MONGOS_PORT"))
+    ssh_user = g("SSH_USER")
+    # CLUSTER_NODES is optional - fallback only when Ops Manager is unreachable.
+    cluster_nodes_raw = g("CLUSTER_NODES", optional=True)
+    cluster_nodes_fallback = cluster_nodes_raw.split(",") if cluster_nodes_raw else None
+
+    # --- MongoDB database tools ---
+    mongo_tools_base = g("MONGO_TOOLS_BASE")
+    mongodump_path = f"{mongo_tools_base}/mongodump"
+    mongorestore_path = f"{mongo_tools_base}/mongorestore"
+
+    # --- Pure Storage FlashArray ---
+    fa_endpoint = g("FA_ENDPOINT")
+    fa_password = g("FA_PASSWORD")
+    fa_username = g("FA_USERNAME")
+    protection_group_name = g("FA_PROTECTION_GROUP")
+    cluster_name = g("FA_CLUSTER_NAME")
+
+    # --- Ops Manager ---
+    om_host = g("OM_BASE_URL").rstrip("/")
+    om_api_version = g("OM_API_VERSION")
+    ops_manager_base_url = f"{om_host}/api/public/{om_api_version}"
+    group_id = g("OM_GROUP_ID")
+    cluster_id = g("OM_CLUSTER_ID")
+    om_public_key = g("OM_PUBLIC_KEY")
+    om_private_key = g("OM_PRIVATE_KEY")
+
+    CFG = Config(
+        EnvVars=env_vars,
+        MongoshPath=mongosh_path,
+        MongosHost=mongos_host,
+        MongosPort=mongos_port,
+        SshUser=ssh_user,
+        ClusterNodesFallback=cluster_nodes_fallback,
+        MongoToolsBase=mongo_tools_base,
+        MongodumpPath=mongodump_path,
+        MongorestorePath=mongorestore_path,
+        FaEndpoint=fa_endpoint,
+        FaUsername=fa_username,
+        FaPassword=fa_password,
+        ProtectionGroupName=protection_group_name,
+        ClusterName=cluster_name,
+        OmHost=om_host,
+        OmApiVersion=om_api_version,
+        OpsManagerBaseUrl=ops_manager_base_url,
+        GroupId=group_id,
+        ClusterId=cluster_id,
+        OmPublicKey=om_public_key,
+        OmPrivateKey=om_private_key,
+    )
+    return CFG
+
+
+def _require_cfg() -> Config:
+    if CFG is None:
+        raise RuntimeError("Config not loaded. Call config.load_config() first (Python equivalent of dot-sourcing Config.ps1).")
+    return CFG
+
+
+# endregion
+
+# region --- SSH options ---
+
+# SSH options: never prompt interactively, fail fast on auth/host-key issues, and multiplex concurrent ssh
+# invocations onto a single TCP connection per remote host (ControlMaster). See Config.ps1 for the full
+# rationale (avoiding sshd MaxStartups saturation). These are passed verbatim to the system `ssh`/`scp`.
+SSH_OPTS: list[str] = [
+    "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "ConnectTimeout=15",
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPath=/tmp/ssh-mux-%C",
+    "-o", "ControlPersist=60s",
+]
+
+# endregion
+
+# region --- Shared helpers (locking + parallel) ---
+
+
+def _as_int(value: str) -> Optional[int]:
+    """PowerShell `$x -as [int]` — returns the int or None."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _process_alive(pid: int) -> bool:
+    """PowerShell `Get-Process -Id $pid -ErrorAction SilentlyContinue` truthiness."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def new_script_lock(lock_path: str) -> None:
+    """Config.ps1: New-ScriptLock. Atomically acquires a per-script lock file, writing pid/host/started.
+    Throws if a live process already holds the lock; clears and re-acquires if the PID is dead."""
+    p = Path(lock_path)
+    if p.exists():
+        locked_pid: Optional[str] = None
+        try:
+            for line in p.read_text().splitlines():
+                if line.startswith("pid="):
+                    locked_pid = line.split("=", 1)[1].strip()
+                    break
+        except OSError:
+            locked_pid = None
+        if locked_pid and _as_int(locked_pid) is not None:
+            if _process_alive(int(locked_pid)):
+                raise RuntimeError(
+                    f"Lock held by live PID {locked_pid} (lock file: {lock_path}). Another run is in progress."
+                )
+            write_host(f"  Stale lock detected (PID {locked_pid} not running) - removing {lock_path}", fg=DARK_YELLOW)
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        else:
+            raise RuntimeError(
+                f"Lock file exists but has no parseable PID: {lock_path}. Inspect and delete manually if no script is running."
+            )
+
+    # O_CREAT|O_EXCL is atomic - fails if the file already exists, so two concurrent starts can't both win
+    # the race past the exists() check above (faithful to FileMode.CreateNew).
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError as e:
+        raise RuntimeError(
+            f"Could not acquire lock at {lock_path}: {e}. Another run may have started concurrently."
+        )
+    try:
+        content = (
+            f"pid={os.getpid()}\n"
+            f"host={socket.gethostname()}\n"
+            f"started={datetime.now(timezone.utc).isoformat()}\n"
+        )
+        os.write(fd, content.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def remove_script_lock(lock_path: str) -> None:
+    """Config.ps1: Remove-ScriptLock. Idempotent; safe to call from finally blocks."""
+    p = Path(lock_path)
+    if p.exists():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def invoke_parallel_or_throw(
+    input_objects: list[Any],
+    script_block: Callable[[Any], dict],
+    step_name: str,
+    throttle_limit: int = 10,
+) -> list[dict]:
+    """Config.ps1: Invoke-ParallelOrThrow. Runs script_block in parallel across input_objects.
+    Each call must return a dict with at minimum {'Success': bool, 'Message': ...} plus a key field named
+    either 'Key' or 'Node'. Throws if any item failed. Returns the list of result dicts.
+
+    Note: ForEach-Object -Parallel runspaces can't see outer functions; Python threads share globals so that
+    constraint is gone, but call sites preserve the same inline-vs-helper structure for a 1:1 translation."""
+    with ThreadPoolExecutor(max_workers=throttle_limit) as ex:
+        results = list(ex.map(script_block, input_objects))
+    failures = [r for r in results if not r.get("Success")]
+    if failures:
+        lines = []
+        for f in failures:
+            ident = f.get("Key") if f.get("Key") else f.get("Node")
+            lines.append(f"  [{ident}] {f.get('Message')}")
+        msg = "\n".join(lines)
+        raise RuntimeError(f"{step_name} failed on {len(failures)} item(s):\n{msg}")
+    return results
+
+
+# endregion
+
+# region --- HTTP Digest auth for Ops Manager API ---
+
+# Implements the standard two-step Digest challenge/response flow (RFC 2617 / qop=auth) manually, exactly as
+# Config.ps1 does (PowerShell's -Authentication Digest is unsupported on macOS in PS7). Shared by snapshot,
+# restore, tailer and replay.
+
+
+def get_md5_hash(plain_text: str) -> str:
+    """Config.ps1: Get-MD5Hash — lowercase hex MD5 of the UTF-8 bytes."""
+    return hashlib.md5(plain_text.encode("utf-8")).hexdigest()
+
+
+def _match(text: str, pattern: str) -> str:
+    """[regex]::Match(...).Groups[1].Value — group 1 or '' if no match."""
+    m = re.search(pattern, text)
+    return m.group(1) if m else ""
+
+
+def _path_and_query(uri: str) -> str:
+    """([uri]$Uri).PathAndQuery"""
+    parts = urlsplit(uri)
+    return parts.path + (f"?{parts.query}" if parts.query else "")
+
+
+def invoke_om_api(
+    method: str = "GET",
+    path: str = "",
+    body: Any = None,
+    path_prefix: str = "backup/third_party/",
+) -> Any:
+    """Config.ps1: Invoke-OmApi. Manual Digest auth against the Ops Manager API.
+
+    PathPrefix controls what is inserted between the base URL and Path. Default 'backup/third_party/' for the
+    third-party backup API; pass '' to reach the public API root (e.g. /groups/{id}/hosts)."""
+    cfg = _require_cfg()
+    uri = f"{cfg.OpsManagerBaseUrl}/{path_prefix}{path}"
+
+    body_data: Optional[str] = None
+    content_type: Optional[str] = None
+    if body:
+        body_data = json.dumps(body, separators=(",", ":"))
+        content_type = "application/json"
+    elif method != "GET":
+        # OM requires Content-Type: application/json on all POST/DELETE even when the body is empty
+        body_data = "{}"
+        content_type = "application/json"
+
+    # Step 1: Probe to get Digest challenge - server returns 401. Include Content-Type on the probe for
+    # non-GET requests to avoid 415.
+    probe_headers = {"Accept": "application/json"}
+    if method != "GET":
+        probe_headers["Content-Type"] = "application/json"
+    probe = requests.request(method, uri, headers=probe_headers, data=body_data, timeout=30)
+    if probe.status_code != 401:
+        raise RuntimeError(
+            f"Expected 401 Digest challenge from {uri} but got HTTP {probe.status_code}: {probe.text}"
+        )
+    challenge = probe.headers.get("WWW-Authenticate", "")
+
+    # Step 2: Parse challenge fields
+    realm = _match(challenge, r'realm="([^"]*)"')
+    nonce = _match(challenge, r'nonce="([^"]*)"')
+    qop = _match(challenge, r'qop="?([^",\s]*)"?')
+    opaque = _match(challenge, r'opaque="([^"]*)"')
+
+    # Step 3: Compute Digest response (RFC 2617 / qop=auth)
+    uri_path = _path_and_query(uri)
+    ha1 = get_md5_hash(f"{cfg.OmPublicKey}:{realm}:{cfg.OmPrivateKey}")
+    ha2 = get_md5_hash(f"{method}:{uri_path}")
+    nc = "00000001"
+    cnonce = uuid.uuid4().hex[:8]
+
+    if qop in ("auth", "auth-int"):
+        digest_response = get_md5_hash(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}")
+        auth_header = (
+            f'Digest username="{cfg.OmPublicKey}", realm="{realm}", nonce="{nonce}", '
+            f'uri="{uri_path}", qop={qop}, nc={nc}, cnonce="{cnonce}", response="{digest_response}"'
+        )
+    else:
+        digest_response = get_md5_hash(f"{ha1}:{nonce}:{ha2}")
+        auth_header = (
+            f'Digest username="{cfg.OmPublicKey}", realm="{realm}", nonce="{nonce}", '
+            f'uri="{uri_path}", response="{digest_response}"'
+        )
+    if opaque:
+        auth_header += f', opaque="{opaque}"'
+
+    # Step 4: Authenticated request
+    headers = {"Accept": "application/json", "Authorization": auth_header}
+    if content_type:
+        headers["Content-Type"] = content_type
+    resp = requests.request(method, uri, headers=headers, data=body_data, timeout=30)
+    resp.raise_for_status()
+    text = resp.text
+    if not text:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return text
+
+
+def invoke_om_api_with_retry(
+    method: str = "GET",
+    path: str = "",
+    body: Any = None,
+    max_attempts: int = 5,
+    backoff_sec: int = 5,
+) -> Any:
+    """Config.ps1: Invoke-OmApiWithRetry. Retries transient errors (network blips, 5xx). Does NOT retry
+    permanent 4xx errors."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return invoke_om_api(method=method, path=path, body=body)
+        except Exception as e:  # noqa: BLE001 - faithful to PS catch-all
+            msg = str(e)
+            # Don't retry on permanent client errors
+            if re.search(r"\b(400|401|403|404|409|415|422)\b", msg):
+                raise
+            if attempt == max_attempts:
+                raise
+            write_host(f"    Transient error on attempt {attempt}: {msg} - retrying in {backoff_sec}s", fg=DARK_YELLOW)
+            time.sleep(backoff_sec)
+
+
+# endregion
+
+# region --- Mongo shell + snapshot-state helpers ---
+
+
+def invoke_mongos(eval_str: str) -> str:
+    """Config.ps1: Invoke-Mongos — runs JavaScript against the mongos router over SSH."""
+    cfg = _require_cfg()
+    remote = f"{cfg.MongoshPath} --quiet --eval '{eval_str}' mongodb://{cfg.MongosHost}:{cfg.MongosPort} 2>/dev/null"
+    proc = subprocess.run(
+        ["ssh", *SSH_OPTS, f"{cfg.SshUser}@{cfg.MongosHost}", remote],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"mongosh failed (exit {proc.returncode}): {proc.stdout}")
+    return proc.stdout.strip()
+
+
+# Shared mongosh JavaScript snippets. Centralized here so Snapshot, Replay, and Tailer all emit the same
+# shape. In PowerShell $OplogTopJs used "\$natural" so PS would not interpolate $natural; in Python strings
+# do not interpolate $, so the literal $natural is written directly.
+LIST_SHARDS_JS = (
+    'var shards=db.adminCommand({listShards:1}).shards; var out=[]; '
+    'for(var i=0;i<shards.length;i++){var s=shards[i]; '
+    'out.push({shardId:s._id,rsHosts:s.host,host:s.host.split("/")[1].split(",")[0]});} '
+    'print(JSON.stringify(out));'
+)
+OPLOG_TOP_JS = (
+    'var latest=db.getSiblingDB("local").oplog.rs.find().sort({"$natural":-1}).limit(1).toArray()[0]; '
+    'print(JSON.stringify({t:latest.ts.t,i:latest.ts.i}));'
+)
+
+
+def invoke_mongosh_js(
+    ssh_target: str,
+    uri: str,
+    js: str,
+    max_attempts: int = 1,
+    context: str = "mongosh",
+) -> str:
+    """Config.ps1: Invoke-MongoshJs. Runs a mongosh --eval expression on a remote host via SSH and returns
+    the raw stdout. Throws on non-zero exit (after any requested retries). Caller parses the returned string."""
+    cfg = _require_cfg()
+    last_exit = 0
+    raw: Optional[str] = None
+    remote = f"{cfg.MongoshPath} --quiet --eval '{js}' {uri} 2>/dev/null"
+    for attempt in range(1, max_attempts + 1):
+        proc = subprocess.run(
+            ["ssh", *SSH_OPTS, f"{cfg.SshUser}@{ssh_target}", remote],
+            capture_output=True,
+            text=True,
+        )
+        raw = proc.stdout
+        last_exit = proc.returncode
+        if last_exit == 0:
+            return raw
+        if attempt < max_attempts:
+            sleep_sec = int(math.pow(2, attempt - 1))
+            write_host(f"    {context} attempt {attempt} failed (exit {last_exit}) - retrying in {sleep_sec}s ...", fg=YELLOW)
+            time.sleep(sleep_sec)
+    raise RuntimeError(f"{context} failed after {max_attempts} attempt(s) (exit {last_exit}, output: {raw})")
+
+
+def wait_om_snapshot_state(
+    snapshot_id: str,
+    target_state: str,
+    timeout_minutes: int = 150,
+    poll_interval_sec: int = 10,
+) -> None:
+    """Config.ps1: Wait-OmSnapshotState. Polls the third-party backup API until the snapshot reaches
+    target_state, aborting on FAILED/FAILING or after a timeout."""
+    cfg = _require_cfg()
+    state = ""
+    deadline = time.monotonic() + timeout_minutes * 60
+    while state != target_state:
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"Snapshot {snapshot_id} timed out waiting for {target_state} state.")
+        if state in ("FAILED", "FAILING"):
+            raise RuntimeError(f"Snapshot {snapshot_id} entered {state} state - aborting.")
+        # Check before sleeping so we catch an immediate transition without paying a full interval.
+        status_response = invoke_om_api_with_retry(
+            path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/snapshot/{snapshot_id}"
+        )
+        state = status_response.get("state") if isinstance(status_response, dict) else getattr(status_response, "state", "")
+        write_host(f"  {datetime.now().strftime('%H:%M:%S')}  state = {state}", fg=CYAN)
+        if state != target_state:
+            time.sleep(poll_interval_sec)
+
+
+# endregion
+
+# region --- FlashArray connection + response helpers (py-pure-client adaptation) ---
+
+# py-pure-client returns ValidResponse (with an .items generator) or ErrorResponse, and does NOT raise on
+# API errors by default. _fa() centralizes the unwrap and maps PowerShell's -ErrorAction:
+#   allow_error=False  -> raise on ErrorResponse   (the cmdlet default / -ErrorAction Stop)
+#   allow_error=True   -> return [] on ErrorResponse (-ErrorAction SilentlyContinue)
+# This reproduces the PS pattern where `if ($Pg)` tests truthiness of a possibly-$null result.
+
+
+def connect_fa(verify_ssl: bool = False):
+    """Shared `Connect-Pfa2Array -EndPoint $FaEndpoint -Credential $FaCred -IgnoreCertificateError`.
+
+    Returns a py-pure-client FlashArray client bound to the gateway. All per-array routing is done by passing
+    context_names=[name] to individual calls (Fusion fleet routing).
+
+    Library-imposed auth mapping: the PowerShell SDK2 accepted a username/password PSCredential, but the
+    py-pure-client FlashArray Client (REST 2.x) authenticates with an API token (or OAuth), not a raw
+    password. We therefore authenticate with FA_PASSWORD treated as the FlashArray API token (see
+    .env.example). FA_USERNAME is retained in .env for parity/reference. verify_ssl=False == -IgnoreCertificateError."""
+    cfg = _require_cfg()
+    from pypureclient import flasharray
+
+    return flasharray.Client(
+        target=cfg.FaEndpoint,
+        api_token=cfg.FaPassword,
+        verify_ssl=verify_ssl,
+    )
+
+
+def _fa(resp: Any, allow_error: bool = False) -> list:
+    """Unwrap a py-pure-client response to a list of items (see region note)."""
+    from pypureclient.responses import ValidResponse
+
+    if isinstance(resp, ValidResponse):
+        return list(resp.items)
+    if allow_error:
+        return []
+    errs = getattr(resp, "errors", None)
+    raise RuntimeError(f"FlashArray API error: {errs}")
+
+
+# endregion
+
+# region --- Runtime topology discovery ---
+
+
+def get_cluster_nodes() -> list[str]:
+    """Config.ps1: Get-ClusterNodes. Returns the hostnames of all nodes belonging to ClusterId in GroupId.
+    Queries the OM /hosts API first (authoritative), falling back to CLUSTER_NODES from .env if OM is
+    unreachable. Throws if neither source can provide nodes."""
+    cfg = _require_cfg()
+    try:
+        # Resolve the clusterName for ClusterId and collect all sibling/child cluster IDs.
+        clusters_response = invoke_om_api(path=f"groups/{cfg.GroupId}/clusters", path_prefix="")
+        results = clusters_response.get("results", []) if isinstance(clusters_response, dict) else []
+        parent_cluster = next((c for c in results if c.get("id") == cfg.ClusterId), None)
+        if not parent_cluster:
+            raise RuntimeError(f"ClusterId '{cfg.ClusterId}' not found in group '{cfg.GroupId}'.")
+        om_cluster_name = parent_cluster.get("clusterName")
+        # Collect IDs of all clusters in the group that share this clusterName (parent + all shards).
+        all_cluster_ids = [c.get("id") for c in results if c.get("clusterName") == om_cluster_name]
+
+        # The /hosts endpoint returns all agents in the group; filter to hosts whose clusterId matches any
+        # of the cluster IDs collected above (shard or config RS members).
+        hosts_response = invoke_om_api(path=f"groups/{cfg.GroupId}/hosts", path_prefix="")
+        host_results = hosts_response.get("results", []) if isinstance(hosts_response, dict) else []
+        nodes = sorted({h.get("hostname") for h in host_results if h.get("clusterId") in all_cluster_ids})
+        if len(nodes) > 0:
+            write_host(f"  Cluster nodes discovered from Ops Manager ({len(nodes)}): {', '.join(nodes)}", fg=CYAN)
+            return nodes
+        write_host(f"  WARNING: OM returned 0 hosts for clusterId={cfg.ClusterId} - falling back to .env", fg=YELLOW)
+    except Exception as e:  # noqa: BLE001 - faithful to PS catch
+        write_host(f"  WARNING: OM node discovery failed ({e}) - falling back to .env", fg=YELLOW)
+    if not cfg.ClusterNodesFallback:
+        raise RuntimeError("Could not discover cluster nodes from Ops Manager and CLUSTER_NODES is not set in .env")
+    write_host(
+        f"  Using CLUSTER_NODES from .env ({len(cfg.ClusterNodesFallback)} nodes): {', '.join(cfg.ClusterNodesFallback)}",
+        fg=DARK_YELLOW,
+    )
+    return cfg.ClusterNodesFallback
+
+
+def resolve_fa_context_names(fa: Any, pg_name: str) -> list[str]:
+    """Config.ps1: Resolve-FaContextNames. Returns the short names of all fleet FlashArrays that have
+    pg_name as a protection group. Filters out FlashBlades. Throws if no arrays have the PG."""
+    # Get all fleet members with minimal retries (fast path)
+    fleet_members = None
+    for attempt in range(1, 3):
+        try:
+            fleet_members = _fa(fa.get_fleets_members())
+            break
+        except Exception as e:  # noqa: BLE001
+            if attempt < 2:
+                write_host(f"  WARNING: Get-Pfa2FleetMember attempt {attempt} failed: {e}. Retrying in 2s...", fg=YELLOW)
+                time.sleep(2)
+            else:
+                raise
+    all_member_names = [m.member.name for m in fleet_members]
+    write_host(f"  Fleet members discovered ({len(all_member_names)}): {', '.join(all_member_names)}", fg=CYAN)
+
+    # Filter out FlashBlades by attempting Get-Pfa2Array (FlashBlades throw "Cross-product" error)
+    flasharray_names: list[str] = []
+    for member_name in all_member_names:
+        array_info = _fa(fa.get_arrays(context_names=[member_name]), allow_error=True)
+        if array_info and array_info[0].os == "Purity//FA":
+            flasharray_names.append(member_name)
+        else:
+            write_host(f"    {member_name}: not a FlashArray (skipped)", fg=DARK_GRAY)
+    write_host(f"  FlashArrays in fleet ({len(flasharray_names)}): {', '.join(flasharray_names)}", fg=CYAN)
+
+    # Check which FlashArrays have the protection group (no retries - fast and reliable)
+    contexts_with_pg: list[str] = []
+    for array_name in flasharray_names:
+        pg = _fa(fa.get_protection_groups(context_names=[array_name], names=[pg_name]), allow_error=True)
+        if pg:
+            contexts_with_pg.append(array_name)
+            write_host(f"    {array_name}: PG '{pg_name}' present", fg=CYAN)
+        else:
+            write_host(f"    {array_name}: PG '{pg_name}' NOT found", fg=DARK_GRAY)
+    if len(contexts_with_pg) == 0:
+        raise RuntimeError(
+            f"No FlashArrays found with protection group '{pg_name}'. Run Initialize-ProtectionGroups.ps1 first."
+        )
+    write_host(f"  Resolved {len(contexts_with_pg)} FlashArray(s) with PG.", fg=GREEN)
+    return contexts_with_pg
+
+
+def get_fa_snapshot_tags(fa: Any, context_names: list[str], snapshot_name: str) -> dict[str, str]:
+    """Config.ps1: Get-FaSnapshotTags. Reads metadata tags from a PG snapshot, trying each array in
+    context_names in order. Returns a dict of tag key -> value from the first array that returns any tag."""
+    for ctx_name in context_names:
+        tags = _fa(
+            fa.get_protection_group_snapshots_tags(context_names=[ctx_name], resource_names=[snapshot_name]),
+            allow_error=True,
+        )
+        if tags and len(tags) > 0:
+            tag_map: dict[str, str] = {}
+            for t in tags:
+                tag_map[t.key] = t.value
+            write_host(f"  Snapshot tags loaded from {ctx_name} ({len(tags)} tags)", fg=CYAN)
+            return tag_map
+    write_host(
+        f"  WARNING: No snapshot tags found on any of {len(context_names)} array(s) for '{snapshot_name}'",
+        fg=YELLOW,
+    )
+    return {}
+
+
+# SCSI serial discovery command, used by Resolve-NodeToArrayVolumeMap. Primary path: findmnt -> lsblk PKNAME
+# -> lsblk SERIAL. Fallback (volume unmounted, e.g. mid-restore): scan all disks for an FA-format serial.
+_SERIAL_CMD = (
+    'p=$(findmnt -no SOURCE /data/mongo 2>/dev/null); if [ -n "$p" ]; then '
+    'pk=$(lsblk -no PKNAME "$p" 2>/dev/null); lsblk -no SERIAL "/dev/$pk" 2>/dev/null | head -1; '
+    'else lsblk -dno SERIAL 2>/dev/null | grep -E "^[0-9a-fA-F]{20,}$" | head -1; fi'
+)
+
+
+def resolve_node_to_array_volume_map(
+    fa: Any,
+    nodes: list[str],
+    ssh_user_param: str,
+    ssh_opts_param: list[str],
+    context_names: list[str],
+) -> dict[str, dict[str, str]]:
+    """Config.ps1: Resolve-NodeToArrayVolumeMap. For each node, SSH to read the SCSI serial of the device
+    backing /data/mongo, then query each fleet array to find which one owns a volume with that serial.
+    Returns node -> {'ShortName': <array>, 'VolumeName': <vol>}. Throws if any node cannot be resolved."""
+    node_map: dict[str, dict[str, str]] = {}
+    for node in nodes:
+        # Pure FlashArray volume serials are 24-character NAA-format hex strings. Enforce a minimum length
+        # so garbled output cannot pass validation and silently match the wrong volume.
+        serial: Optional[str] = None
+        for attempt in range(1, 4):
+            if serial:
+                break
+            proc = subprocess.run(
+                ["ssh", *ssh_opts_param, f"{ssh_user_param}@{node}", _SERIAL_CMD],
+                capture_output=True,
+                text=True,
+            )
+            candidates = [
+                line.strip() for line in proc.stdout.splitlines() if re.match(r"^[0-9a-fA-F]{20,}$", line.strip())
+            ]
+            serial = candidates[-1].lower() if candidates else None
+            if not serial and attempt < 3:
+                time.sleep(1)
+        if not serial or not re.match(r"^[0-9a-f]{20,}$", serial):
+            raise RuntimeError(
+                f"Could not read FA volume serial from {node} (got: '{serial}'). "
+                "Verify /data/mongo is mounted and the block device is a Pure Storage pRDM."
+            )
+        write_host(f"  {node} serial: {serial}", fg=CYAN)
+
+        # Query each context array to find which one owns the volume with this serial.
+        # FA stores serials as uppercase hex; apply upper() in the filter string.
+        found = False
+        for ctx_name in context_names:
+            vols = _fa(
+                fa.get_volumes(context_names=[ctx_name], filter=f"serial='{serial.upper()}'"),
+                allow_error=True,
+            )
+            if vols:
+                vol = vols[0]
+                node_map[node] = {"ShortName": ctx_name, "VolumeName": vol.name}
+                write_host(f"    -> {ctx_name} / {vol.name}", fg=GREEN)
+                found = True
+                break
+        if not found:
+            raise RuntimeError(
+                f"No FlashArray volume with serial '{serial}' found across any fleet array for node {node}. "
+                "Verify the pRDM is presented from the expected array."
+            )
+    return node_map
+
+
+# endregion

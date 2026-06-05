@@ -1,0 +1,13 @@
+reference/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+swagger.json
+PureStoragePowerShellSDK2-Help.txt
+.claude/
+.DS_Store

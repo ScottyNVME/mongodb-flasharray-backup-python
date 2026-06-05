@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mongodb-flasharray-backup"
+version = "0.1.0"
+description = "Crash-consistent snapshot backup + PITR of a MongoDB 8.0 sharded cluster on Pure Storage FlashArray/Fusion (Python port of nocentino/mongodb-flasharray-backup)."
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv>=1.0",
+    "py-pure-client>=1.62",
+    "requests>=2.31",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+new-mongo-snapshot            = "mongodb_flasharray_backup.snapshot:main"
+restore-mongo-snapshot        = "mongodb_flasharray_backup.restore:main"
+initialize-protection-groups  = "mongodb_flasharray_backup.init_protection_groups:main"
+remove-old-artifacts          = "mongodb_flasharray_backup.remove_old_artifacts:main"
+start-oplog-tailer            = "mongodb_flasharray_backup.pitr.start_oplog_tailer:main"
+stop-oplog-tailer             = "mongodb_flasharray_backup.pitr.stop_oplog_tailer:main"
+invoke-oplog-replay           = "mongodb_flasharray_backup.pitr.invoke_oplog_replay:main"
+initialize-test-data          = "mongodb_flasharray_backup.testing.initialize_test_data:main"
+start-insert-load             = "mongodb_flasharray_backup.testing.start_insert_load:main"
+run-all-tests                 = "mongodb_flasharray_backup.testing.run_all_tests:main"
+
+[tool.setuptools.packages.find]
+include = ["mongodb_flasharray_backup*"]
+
+[tool.setuptools.package-data]
+"mongodb_flasharray_backup.pitr" = ["decode_oplogs.py"]

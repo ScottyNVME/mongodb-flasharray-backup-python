@@ -1,0 +1,4 @@
+python-dotenv>=1.0
+py-pure-client>=1.62        # Fusion fleet + per-array context_names routing (FlashArray REST 2.x)
+requests>=2.31             # Ops Manager third-party backup API (HTTP Digest)
+typer>=0.12               # one CLI per original script
