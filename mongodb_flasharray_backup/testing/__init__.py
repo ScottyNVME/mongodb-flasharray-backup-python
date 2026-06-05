@@ -1,1 +1,1 @@
-"""Faithful translations of the upstream tests/ PowerShell scripts."""
+"""End-to-end test orchestration: test-data seeding, insert load, and the 3-phase suite."""

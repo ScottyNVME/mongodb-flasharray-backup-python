@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Invoke-OplogReplay - Apply captured oplog segments to a cluster restored from FA snapshot.
-
-1:1 faithful Python translation of reference/pitr/Invoke-OplogReplay.ps1.
+"""Apply captured oplog segments to a cluster restored from FA snapshot.
 
 After restoring from a FlashArray snapshot (which puts the cluster at time T1), this script
-applies the oplog segments captured by Start-OplogTailer up to a target timestamp T2,
+applies the oplog segments captured by the oplog tailer up to a target timestamp T2,
 advancing the cluster to exactly T2 without any additional human intervention.
 
 Each shard's .oplogs segments are applied in capture order directly to that shard's primary
 using mongorestore --oplogReplay --oplogFile. --oplogLimit is applied to any segment whose
-end timestamp extends beyond -TargetTimestamp. Replay is per-shard (not via mongos) because
+end timestamp extends beyond --target-timestamp. Replay is per-shard (not via mongos) because
 the oplog is shard-local.
 
 Usage:
@@ -17,7 +15,6 @@ Usage:
   python -m mongodb_flasharray_backup.pitr.invoke_oplog_replay --snapshot-tag "om-20260505-200455" --target-timestamp 1778030500
 """
 
-# Maps PS lines 1-15: param() block + #Requires + dot-sourcing Config.ps1.
 import json
 import os
 import re
@@ -32,17 +29,14 @@ from .. import config
 
 
 # ------------------------------------------------------------------------------------------------
-# Colors used by the source that are not exported by config.py. Faithful PowerShell -> click map:
-#   White    -> bright_white   (PS "White" renders bright)
-#   DarkCyan -> cyan           (PS "DarkCyan" renders as standard cyan)
-#   Gray     -> white          (PS "Gray" renders as standard/light gray)
+# Console colors not exported by config.py.
 # ------------------------------------------------------------------------------------------------
 WHITE = "bright_white"
 DARK_CYAN = "cyan"
 GRAY = "white"
 
 
-# Maps PS line 4: [ValidatePattern('^om-\d{8}-\d{6}$')] on $SnapshotTag.
+# Enforce the ^om-\d{8}-\d{6}$ pattern on the snapshot tag.
 def _validate_snapshot_tag(value: str) -> str:
     if not re.match(r"^om-\d{8}-\d{6}$", value):
         raise typer.BadParameter("SnapshotTag must match pattern ^om-\\d{8}-\\d{6}$")
@@ -50,9 +44,8 @@ def _validate_snapshot_tag(value: str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------
-# Start-Transcript equivalent: tee stdout + stderr to the log file while still writing to console.
-# This captures Write-Host (config.write_host / typer.secho) and command output exactly like
-# PowerShell's Start-Transcript -Append.
+# Tee stdout + stderr to the log file while still writing to console, so console output
+# (config.write_host / typer.secho) and command output are captured in the appended log.
 # ------------------------------------------------------------------------------------------------
 class _Tee:
     def __init__(self, stream, log_handle):
@@ -72,44 +65,39 @@ class _Tee:
         return getattr(self._stream, name)
 
 
-# Maps PS lines 2-298: the whole script body (param block + main logic in try/finally).
 def _run(
-    # PS lines 3-5: [Parameter(Mandatory)] [ValidatePattern('^om-\d{8}-\d{6}$')] [string]$SnapshotTag
     snapshot_tag: str = typer.Option(
         ...,
         "--snapshot-tag",
         callback=_validate_snapshot_tag,
         help="Snapshot tag to replay (pattern: om-YYYYMMDD-HHMMSS)",
     ),
-    # PS line 7: [long]$TargetTimestamp = 0  (0 = replay all; Unix epoch seconds otherwise)
+    # 0 = replay all; Unix epoch seconds otherwise
     target_timestamp: int = typer.Option(
         0,
         "--target-timestamp",
         help="0 = replay all; Unix epoch seconds otherwise",
     ),
-    # PS line 9: [string]$VerifyDatabase = 'testdb'
     verify_database: str = typer.Option(
         "testdb",
         "--verify-database",
         help="database to count docs in during post-replay smoke test",
     ),
-    # PS line 11: [string]$T2MarkPath = ''
     t2_mark_path: str = typer.Option(
         "",
         "--t2-mark-path",
         help="optional: t2-mark.json with counts captured after stop-load (default: <OplogDir>/t2-mark.json)",
     ),
-    # PS line 13: [switch]$SkipVerification
     skip_verification: bool = typer.Option(
         False,
         "--skip-verification",
         help="opt out of post-replay range-bound assertion (counts are still printed)",
     ),
 ):
-    # PS line 15: . "$PSScriptRoot/Config.ps1" -> load config FIRST (throws like the original without .env).
+    # Load config FIRST (throws without .env).
     config.load_config()
 
-    # PS lines 42-45: $LogDir / New-Item / $LogPath / Start-Transcript -Path $LogPath -Append.
+    # Log dir + log file appended to during this run.
     log_dir = Path(os.path.expanduser("~")) / "mongo-oplogreplay-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"oplogreplay-{snapshot_tag}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
@@ -119,21 +107,20 @@ def _run(
     sys.stdout = _Tee(orig_stdout, log_handle)
     sys.stderr = _Tee(orig_stderr, log_handle)
 
-    # PS line 47: try {
     try:
 
-        # PS lines 49-53: $OplogDir + existence check.
+        # Oplog stream directory + existence check.
         oplog_dir = Path(os.path.expanduser("~")) / "mongo-oplog-stream" / snapshot_tag
         if not oplog_dir.exists():
             raise RuntimeError(
-                f"Oplog stream directory not found at {oplog_dir}. Run Start-OplogTailer.ps1 first."
+                f"Oplog stream directory not found at {oplog_dir}. Run start-oplog-tailer first."
             )
 
-        # PS lines 55-62: header + replay target description.
+        # Header + replay target description.
         config.write_host(f"\n=== Oplog Replay for snapshot {snapshot_tag} ===", fg=config.YELLOW)
         config.write_host(f"  Source : {oplog_dir}", fg=config.CYAN)
         if target_timestamp > 0:
-            # PS line 58: [System.DateTimeOffset]::FromUnixTimeSeconds($TargetTimestamp).DateTime.ToString('o')
+            # Render the Unix target timestamp as an ISO-8601 UTC datetime.
             target_dt = (
                 datetime.fromtimestamp(target_timestamp, tz=timezone.utc)
                 .replace(tzinfo=None)
@@ -143,7 +130,7 @@ def _run(
         else:
             config.write_host("  Replay to: end of captured oplog (all entries)", fg=config.CYAN)
 
-        # PS lines 64-69: Connect to FlashArray + read snapshot metadata tags.
+        # Connect to FlashArray + read snapshot metadata tags.
         config.write_host(
             f"  Connecting to FlashArray gateway {config.CFG.FaEndpoint} ...", fg=config.CYAN
         )
@@ -154,7 +141,7 @@ def _run(
         )
         config.write_host("  FlashArray connected.", fg=config.GREEN)
 
-        # PS lines 71-79: Discover current shard primaries (post-restore).
+        # Discover current shard primaries (post-restore).
         shard_json = config.invoke_mongosh_js(
             ssh_target=config.CFG.MongosHost,
             uri=f"mongodb://{config.CFG.MongosHost}:{config.CFG.MongosPort}",
@@ -167,14 +154,14 @@ def _run(
         for s in shards:
             config.write_host(f"    {s['shardId']} -> {s['host']}", fg=WHITE)
 
-        # PS lines 81-102: Warm up each shard's routing cache via mongos before per-shard replay.
+        # Warm up each shard's routing cache via mongos before per-shard replay.
         config.write_host("\n  Warming up shard routing cache via mongos...", fg=config.CYAN)
         warmup_script = (
             "var dbs=db.adminCommand({listDatabases:1}).databases; "
             "for(var i=0;i<dbs.length;i++){try{db.getSiblingDB(dbs[i].name).getCollectionNames();}catch(e){}} "
             "print('routing-cache-warmed');"
         )
-        # PS lines 90-102: best-effort (non-fatal) warm-up.
+        # Best-effort (non-fatal) warm-up.
         try:
             warmup_out = config.invoke_mongosh_js(
                 ssh_target=config.CFG.MongosHost,
@@ -194,10 +181,9 @@ def _run(
                 f"  WARNING: routing cache warm-up failed (non-fatal): {e}", fg=config.YELLOW
             )
 
-        # PS line 104: $Errors = [System.Collections.Generic.List[string]]::new()
         errors: list[str] = []
 
-        # PS lines 106-113: Deploy the .oplogs decoder script to every replay node.
+        # Deploy the .oplogs decoder script to every replay node.
         # decode_oplogs.py lives in the same directory as this module.
         decoder_src = Path(__file__).with_name("decode_oplogs.py")
         if not decoder_src.exists():
@@ -206,7 +192,7 @@ def _run(
             )
         remote_decoder = "/tmp/decode_oplogs.py"
 
-        # PS lines 115-125: Load T1 atClusterTime from snapshot tag for pre-snapshot segment filtering.
+        # Load T1 atClusterTime from snapshot tag for pre-snapshot segment filtering.
         t1_at_cluster_time = 0
         if snap_tags.get("mongo:t1ts"):
             t1_at_cluster_time = int(snap_tags["mongo:t1ts"])
@@ -219,7 +205,7 @@ def _run(
                 fg=config.YELLOW,
             )
 
-        # PS lines 127-165: Build the per-shard work list (flat $Plan list of work units).
+        # Build the per-shard work list (a flat list of work units).
         plan: list[dict] = []
         for s in shards:
             shard_id = s["shardId"]
@@ -230,7 +216,7 @@ def _run(
                     fg=config.YELLOW,
                 )
                 continue
-            # PS line 139: Get-ChildItem $SegDir -Filter '*.oplogs' -File | Sort-Object Name
+            # *.oplogs segment files, sorted by name (lexical == chronological order).
             files = sorted(
                 [f for f in seg_dir.iterdir() if f.is_file() and f.name.endswith(".oplogs")],
                 key=lambda f: f.name,
@@ -242,17 +228,16 @@ def _run(
                 )
                 continue
             for f in files:
-                # PS lines 145-148: Parse timestamps from the OM filename: <startTs>_<endTs>.oplogs
+                # Parse timestamps from the OM filename: <startTs>_<endTs>.oplogs
                 parts = f.stem.split("_")
                 start_ts = int(parts[0])
                 end_ts = int(parts[1])
-                # PS line 152: Skip segments entirely before or at the T1 snapshot atClusterTime.
+                # Skip segments entirely before or at the T1 snapshot atClusterTime.
                 if t1_at_cluster_time > 0 and end_ts <= t1_at_cluster_time:
                     continue
-                # PS line 154: Skip files whose entire window is beyond the PIT target.
+                # Skip files whose entire window is beyond the PIT target.
                 if target_timestamp > 0 and start_ts > target_timestamp:
                     continue
-                # PS lines 155-163: $Plan.Add([pscustomobject]@{...})
                 plan.append(
                     {
                         "ShardId": shard_id,
@@ -265,7 +250,7 @@ def _run(
                     }
                 )
 
-        # PS lines 167-171: plan summary.
+        # Plan summary.
         if len(plan) == 0:
             config.write_host(
                 "\n  No post-T1 oplog segments to replay (all available segments pre-date the T1 snapshot). Cluster remains at T1 restore state.",
@@ -278,13 +263,12 @@ def _run(
                 fg=config.CYAN,
             )
 
-        # PS lines 173-183: SCP the decoder to each distinct agent node once before the replay loop.
+        # SCP the decoder to each distinct agent node once before the replay loop.
         deployed_nodes: set[str] = set()
         for unit in plan:
             if unit["Node"] not in deployed_nodes:
                 deployed_nodes.add(unit["Node"])
                 config.write_host(f"  Deploying decoder to {unit['Node']}...", fg=config.CYAN)
-                # PS line 178: scp @SshOpts $DecoderSrc "${SshUser}@$($Unit.Node):${RemoteDecoder}" 2>&1
                 proc = subprocess.run(
                     [
                         "scp",
@@ -298,7 +282,7 @@ def _run(
                 if proc.returncode != 0:
                     raise RuntimeError(f"Failed to SCP decode_oplogs.py to {unit['Node']}")
 
-        # PS lines 185-230: Replay loop.
+        # Replay loop.
         prev_shard_id = None
         for unit in plan:
             if unit["ShardId"] != prev_shard_id:
@@ -310,18 +294,15 @@ def _run(
             remote_file = (
                 f"/tmp/oplog-replay-{snapshot_tag}-{unit['ShardId']}-{unit['SegLabel']}.oplogs"
             )
-            # PS line 196: $Bytes = (Get-Item $Unit.LocalPath).Length
             num_bytes = Path(unit["LocalPath"]).stat().st_size
-            # PS lines 200-201: --oplogLimit applied only when file extends beyond the PIT target.
+            # --oplogLimit applied only when file extends beyond the PIT target.
             apply_limit = target_timestamp > 0 and unit["EndTs"] > target_timestamp
             oplog_limit = f"--oplogLimit '{target_timestamp}:1'" if apply_limit else ""
 
-            # PS line 203: "    seg {0}  {1:N1} KB -> {2}" -f SegLabel, (Bytes/1KB), Node
             kb = num_bytes / 1024
             config.write_host(
                 f"    seg {unit['SegLabel']}  {kb:,.1f} KB -> {unit['Node']}", fg=DARK_CYAN
             )
-            # PS line 204: scp @SshOpts $Unit.LocalPath "${SshUser}@$($Unit.Node):${RemoteFile}" 2>&1
             proc = subprocess.run(
                 [
                     "scp",
@@ -333,11 +314,10 @@ def _run(
                 text=True,
             )
             if proc.returncode != 0:
-                # PS line 206
                 errors.append(f"{unit['ShardId']}/{unit['SegLabel']}: scp to {unit['Node']} failed")
                 continue
 
-            # PS lines 211-220: build the remote replay command (here-string).
+            # Build the remote replay command.
             replay_cmd = f"""set +e
 TMPDIR=$(mktemp -d)
 python3 {remote_decoder} {remote_file} > $TMPDIR/oplog.bson
@@ -347,7 +327,6 @@ EC=$?
 rm -rf $TMPDIR {remote_file}
 exit $EC
 """
-            # PS line 221: $Out = ssh @SshOpts "${SshUser}@$($Unit.Node)" $ReplayCmd 2>&1
             replay_proc = subprocess.run(
                 [
                     "ssh",
@@ -358,17 +337,13 @@ exit $EC
                 capture_output=True,
                 text=True,
             )
-            # PS line 222: $RestoreExit = $LASTEXITCODE
             restore_exit = replay_proc.returncode
-            # PS line 223: Write-Host ($Out -join "`n") -ForegroundColor Gray
-            # 2>&1 in PS merges stderr into the captured output stream.
+            # Merge stderr into the captured output stream.
             out = (replay_proc.stdout or "") + (replay_proc.stderr or "")
             config.write_host(out, fg=GRAY)
             if restore_exit == 0:
-                # PS line 225
                 config.write_host(f"    seg {unit['SegLabel']}: OK", fg=config.GREEN)
             else:
-                # PS lines 227-228
                 errors.append(
                     f"{unit['ShardId']}/{unit['SegLabel']}: mongorestore exit {restore_exit} on {unit['Node']}"
                 )
@@ -377,12 +352,12 @@ exit $EC
                     fg=config.YELLOW,
                 )
 
-        # PS lines 232-234: fail if any segment errored.
+        # Fail if any segment errored.
         if len(errors) > 0:
             joined = "\n".join(errors)
             raise RuntimeError(f"Oplog replay failed on {len(errors)} segment(s):\n{joined}")
 
-        # PS lines 236-248: Post-replay verification: count docs as a sanity check.
+        # Post-replay verification: count docs as a sanity check.
         config.write_host("\n=== Post-Replay Verification ===", fg=config.YELLOW)
         load_test_count = config.invoke_mongosh_js(
             ssh_target=config.CFG.MongosHost,
@@ -400,16 +375,16 @@ exit $EC
         config.write_host(f"  {verify_database}.loadtest : {load_test_count.strip()}", fg=config.CYAN)
         config.write_host(f"  {verify_database}.payload  : {payload_count.strip()}", fg=config.CYAN)
 
-        # PS lines 250-258: Range-bound assertion setup ($Counts hashtable).
+        # Range-bound assertion setup.
         counts = {
             "loadtest": int(load_test_count.strip()),
             "payload": int(payload_count.strip()),
         }
-        # PS line 259: default $T2MarkPath to <OplogDir>/t2-mark.json when not supplied.
+        # Default t2_mark_path to <OplogDir>/t2-mark.json when not supplied.
         if not t2_mark_path:
             t2_mark_path = str(oplog_dir / "t2-mark.json")
 
-        # PS lines 261-292: verification branches.
+        # Verification branches.
         if skip_verification:
             config.write_host("  Verification skipped (-SkipVerification)", fg=config.YELLOW)
         elif not snap_tags.get("mongo:preSnap"):
@@ -423,49 +398,45 @@ exit $EC
                 fg=config.YELLOW,
             )
         else:
-            # PS lines 268-271: parse preSnap tag JSON and t2-mark.json.
+            # Parse preSnap tag JSON and t2-mark.json.
             pre_snap = json.loads(snap_tags["mongo:preSnap"])
             with open(t2_mark_path, "r", encoding="utf-8") as fh:
                 t2_mark = json.loads(fh.read())
             pre_db = pre_snap.get(verify_database)
             t2_mark_counts = t2_mark.get("counts") if isinstance(t2_mark, dict) else None
             t2_db = t2_mark_counts.get(verify_database) if isinstance(t2_mark_counts, dict) else None
-            # PS lines 272-273: skip if entries missing for VerifyDatabase.
+            # Skip if entries missing for verify_database.
             if pre_db is None or t2_db is None:
                 config.write_host(
                     f"  WARNING: mongo:preSnap tag or t2-mark missing entries for '{verify_database}' - skipping range check",
                     fg=config.YELLOW,
                 )
             else:
-                # PS lines 275-291: per-collection range check.
+                # Per-collection range check.
                 mismatches: list[str] = []
                 for coll in counts.keys():
                     got = counts[coll]
                     lo = int(pre_db[coll])
                     hi = int(t2_db[coll])
                     if got < lo or got > hi:
-                        # PS lines 281-282
                         mismatches.append(f"{verify_database}.{coll}: {got} NOT IN [{lo}, {hi}]")
                         config.write_host(
                             f"  Baseline FAIL : {verify_database}.{coll} = {got} NOT IN [{lo}, {hi}]",
                             fg=config.RED,
                         )
                     else:
-                        # PS lines 284-285
                         tail = hi - got
                         config.write_host(
                             f"  Baseline OK   : {verify_database}.{coll} = {got} in [{lo}, {hi}] (unrecoveredTail={tail})",
                             fg=config.GREEN,
                         )
-                # PS lines 288-290: raise if any mismatch.
+                # Raise if any mismatch.
                 if len(mismatches) > 0:
                     joined = "\n".join(mismatches)
                     raise RuntimeError(f"Post-replay verification failed:\n{joined}")
 
-        # PS line 294
         config.write_host("\n=== Oplog Replay Complete ===", fg=config.GREEN)
 
-    # PS lines 296-298: finally { try { Stop-Transcript } catch {} }
     finally:
         try:
             sys.stdout = orig_stdout

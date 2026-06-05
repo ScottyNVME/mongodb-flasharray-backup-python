@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start-OplogTailer.ps1 -> Python (faithful 1:1 translation).
+"""Continuous oplog tailer using the Ops Manager third-party backup Oplog Snapshot API.
 
 ###############################################################################################################################
 # Continuous Oplog Tailer - Ops Manager third-party backup Oplog Snapshot API
@@ -18,22 +18,21 @@
 #
 # The OM agent writes one .oplogs file per minute per RS at brs.thirdparty.baseOplogFilePath.
 # Files are stored locally using the original OM filename (<startTs>_<endTs>.oplogs) so that
-# lexical sort on disk equals chronological order for Invoke-OplogReplay.ps1.
+# lexical sort on disk equals chronological order for the replay step.
 #
 # Gap detection: each READY response includes previousEnd per range. If previousEnd does not
 # match the stored lastEnd, an oplog gap exists and a gap-<timestamp>.json marker is written.
-# With -AbortOnGap the loop terminates; without it, capture continues past the gap.
+# With --abort-on-gap the loop terminates; without it, capture continues past the gap.
 #
-# Stop: Stop-OplogTailer.ps1 writes ~/mongo-oplog-stream/<tag>/.stop. The tailer checks for
+# Stop: the stop command writes ~/mongo-oplog-stream/<tag>/.stop. The tailer checks for
 # it at the top of each iteration and exits cleanly after writing a .stopped marker.
 #
 # NOTE: Start this tailer BEFORE taking the first FlashArray snapshot. The OM API maintains
-# coverage continuity via previousEnd - no anchor from the snapshot sidecar is needed.
+# coverage continuity via previousEnd - no separate anchor is needed.
 # If the tailer starts after the FA snapshot, coverage begins at the first oplog snapshot's
 # start time, not the snapshot point, leaving a gap.
 ###############################################################################################################################
 """
-# Maps original lines 1-12: param block + dot-source Config.ps1
 import json
 import logging
 import os
@@ -49,12 +48,11 @@ import typer
 from .. import config
 
 
-# --- ValidatePattern callback for -SnapshotTag (original lines 3-5) ---
+# --- Pattern-validation callback for --snapshot-tag ---
 _SNAPSHOT_TAG_RE = re.compile(r"^om-\d{8}-\d{6}$")
 
 
 def _validate_snapshot_tag(value: str) -> str:
-    # [ValidatePattern('^om-\d{8}-\d{6}$')]
     if not _SNAPSHOT_TAG_RE.match(value):
         raise typer.BadParameter(
             r"Value must match pattern ^om-\d{8}-\d{6}$"
@@ -63,7 +61,6 @@ def _validate_snapshot_tag(value: str) -> str:
 
 
 def _run(
-    # Original param() block (lines 2-11)
     snapshot_tag: str = typer.Option(
         ...,
         "--snapshot-tag",
@@ -87,7 +84,7 @@ def _run(
         help="abort the loop when an oplog gap is detected; default: warn and continue",
     ),
 ) -> None:
-    # Line 12: . "$PSScriptRoot/Config.ps1"  -> load_config() first
+    # Load config first.
     config.load_config()
 
     # Read env-derived values used in this script
@@ -95,16 +92,14 @@ def _run(
     cluster_id = config.CFG.ClusterId
     ssh_user = config.CFG.SshUser
 
-    # Lines 45-47: $ErrorActionPreference = 'Stop' (twice; Python raises by default)
-
-    # Lines 49-52: paths + ensure $Root exists
+    # Paths + ensure root exists
     home = Path(os.path.expanduser("~"))
     root = home / "mongo-oplog-stream" / snapshot_tag
     stop_file = root / ".stop"
     state_file = root / "state.json"
     root.mkdir(parents=True, exist_ok=True)
 
-    # Lines 54-57: log dir + Start-Transcript (Python logging to console + file)
+    # Log dir + logging to console and file
     log_dir = home / "mongo-oplogtailer-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / (
@@ -124,21 +119,18 @@ def _run(
         return datetime.now().strftime("%H:%M:%S")
 
     def _utc_iso() -> str:
-        # (Get-Date).ToUniversalTime().ToString('o')
         return datetime.now(timezone.utc).isoformat()
 
-    # Line 59: try {  ... line 272: } finally { Stop-Transcript }
     try:
 
-        # region --- Pre-flight --- (lines 61-123)
+        # region --- Pre-flight ---
 
-        # Line 63
         config.write_host(
             f"\n=== Oplog Tailer (OM Oplog Snapshot API) for {snapshot_tag} ===",
             fg=config.YELLOW,
         )
 
-        # Lines 65-82: verify brs.thirdparty.baseOplogFilePath
+        # Verify brs.thirdparty.baseOplogFilePath
         config.write_host("  Checking OM oplog path configuration...", fg=config.CYAN)
         try:
             settings = config.invoke_om_api(path="group/settings")
@@ -148,25 +140,22 @@ def _run(
                 if isinstance(inner, dict):
                     oplog_base_path = inner.get("brs.thirdparty.baseOplogFilePath")
             if not oplog_base_path:
-                # Lines 71-74
                 raise RuntimeError(
                     "brs.thirdparty.baseOplogFilePath is not configured in Ops Manager. "
                     "Navigate to Admin -> General -> Ops Manager Config and set this key to the oplog directory path on each agent node."
                 )
             config.write_host(f"  OM oplog base path: {oplog_base_path}", fg=config.GREEN)
-        except Exception as e:  # line 76: catch
-            # Line 77: if ($_.ToString() -match 'USER_UNAUTHORIZED|401')
+        except Exception as e:
+            # Missing admin privileges to read the config is non-fatal; anything else re-raises.
             if re.search(r"USER_UNAUTHORIZED|401", str(e)):
-                # Line 78: Write-Warning
                 logger.warning(
                     "WARNING: Cannot read OM oplog path config (requires admin privileges). "
                     "Proceeding - ensure brs.thirdparty.baseOplogFilePath is set in the OM Admin UI."
                 )
             else:
-                # Line 80: throw
                 raise
 
-        # Lines 84-97: select one tailing node per RS
+        # Select one tailing node per RS
         cluster_detail = config.invoke_om_api(
             path=f"group/{group_id}/clusters/{cluster_id}"
         )
@@ -196,7 +185,7 @@ def _run(
                 fg=config.CYAN,
             )
 
-        # Lines 99-103: register preferred oplog nodes (idempotent)
+        # Register preferred oplog nodes (idempotent)
         config.invoke_om_api(
             method="POST",
             path=f"group/{group_id}/clusters/{cluster_id}/preferredOplogNodes",
@@ -207,14 +196,14 @@ def _run(
             fg=config.GREEN,
         )
 
-        # Lines 105-107: load existing state
+        # Load existing state
         if state_file.exists():
             state = json.loads(state_file.read_text())
         else:
             state = None
         job_seq = int(state["totalJobs"]) if state else 0
 
-        # Lines 109-116: write .started marker
+        # Write .started marker
         started = OrderedDict()
         started["snapshotTag"] = snapshot_tag
         started["pid"] = os.getpid()
@@ -223,43 +212,39 @@ def _run(
         started["tailingNodes"] = list(tailing_node_ids)
         (root / ".started").write_text(json.dumps(started, indent=2))
 
-        # Lines 118-121
         config.write_host(f"  Root     : {root}", fg=config.CYAN)
         config.write_host(
             f"  Interval : {interval_sec}s  timeout: {timeout_minutes}m  poll: {poll_interval_sec}s",
             fg=config.CYAN,
         )
         config.write_host(
-            f"  Stop with: pwsh ./pitr/Stop-OplogTailer.ps1 -SnapshotTag '{snapshot_tag}'",
+            f"  Stop with: stop-oplog-tailer --snapshot-tag '{snapshot_tag}'",
             fg=config.CYAN,
         )
         config.write_host("", fg=None)
 
         # endregion
 
-        # Line 125: while (-not (Test-Path $StopFile))
+        # Loop until the stop sentinel appears.
         while not stop_file.exists():
-            iter_start = datetime.now()  # line 126
-            job_completed = False        # line 127
-            oplog_snapshot_id = None     # line 128
+            iter_start = datetime.now()
+            job_completed = False
+            oplog_snapshot_id = None
 
-            try:  # line 130
-                # region --- Create and start oplog snapshot job --- (lines 131-140)
+            try:
+                # region --- Create and start oplog snapshot job ---
 
-                # Lines 133-135
                 create_resp = config.invoke_om_api(
                     method="POST",
                     path=f"group/{group_id}/clusters/{cluster_id}/oplogSnapshot",
                     body={"timeoutMinutes": timeout_minutes},
                 )
                 oplog_snapshot_id = create_resp.get("oplogSnapshotId")
-                # Line 136
                 config.write_host(
                     f"  [{_now_hms()}]  Job {job_seq + 1}: created  id={oplog_snapshot_id}",
                     fg=config.CYAN,
                 )
 
-                # Line 138
                 config.invoke_om_api(
                     method="POST",
                     path=f"group/{group_id}/clusters/{cluster_id}/oplogSnapshot/{oplog_snapshot_id}/start",
@@ -267,52 +252,48 @@ def _run(
 
                 # endregion
 
-                # region --- Poll until READY --- (lines 142-156)
+                # region --- Poll until READY ---
 
-                # Lines 144-146
                 deadline = datetime.now().timestamp() + timeout_minutes * 60
                 snap_state = ""
                 ready_resp = None
-                # Line 147: while ($SnapState -ne 'READY')
                 while snap_state != "READY":
-                    if datetime.now().timestamp() > deadline:  # line 148
+                    if datetime.now().timestamp() > deadline:
                         raise RuntimeError(
                             f"Oplog snapshot {oplog_snapshot_id} timed out waiting for READY."
                         )
-                    if snap_state in ("FAILED", "FAILING"):  # line 149
+                    if snap_state in ("FAILED", "FAILING"):
                         raise RuntimeError(
                             f"Oplog snapshot {oplog_snapshot_id} entered {snap_state} state."
                         )
-                    time.sleep(poll_interval_sec)  # line 150
-                    # Line 151
+                    time.sleep(poll_interval_sec)
                     ready_resp = config.invoke_om_api_with_retry(
                         path=f"group/{group_id}/clusters/{cluster_id}/oplogSnapshot/{oplog_snapshot_id}"
                     )
-                    snap_state = ready_resp.get("state")  # line 152
+                    snap_state = ready_resp.get("state")
                     config.write_host(
                         f"  [{_now_hms()}]  state = {snap_state}", fg=config.DARK_GRAY
-                    )  # line 153
+                    )
 
                 # endregion
 
-                # region --- Gap detection and file copy --- (lines 158-215)
+                # region --- Gap detection and file copy ---
 
-                job_seq += 1          # line 160
-                new_last_end = None   # line 161
+                job_seq += 1
+                new_last_end = None
 
-                # Line 163: foreach ($Range in $ReadyResp.ranges)
                 for range_ in (ready_resp.get("ranges") or []):
-                    range_end = range_.get("end")            # line 164
-                    range_prev_end = range_.get("previousEnd")  # line 165
+                    range_end = range_.get("end")
+                    range_prev_end = range_.get("previousEnd")
 
-                    # Lines 167-186: gap check
+                    # Gap check: a range's previousEnd must equal the lastEnd we last stored;
+                    # any mismatch means oplog entries are missing for this window.
                     if state and state.get("lastEnd") and range_prev_end:
                         stored_t = int(state["lastEnd"]["time"])
                         stored_i = int(state["lastEnd"]["inc"])
                         prev_t = int(range_prev_end["time"])
                         prev_i = int(range_prev_end["inc"])
                         if stored_t != prev_t or stored_i != prev_i:
-                            # Lines 176-177
                             gap_msg = (
                                 f"Oplog gap: stored lastEnd=({stored_t}:{stored_i}) but "
                                 f"OM previousEnd=({prev_t}:{prev_i}). PIT in this window is unrecoverable."
@@ -320,7 +301,7 @@ def _run(
                             config.write_host(
                                 f"  [{_now_hms()}]  WARNING: {gap_msg}", fg=config.RED
                             )
-                            # Lines 178-183: write gap marker
+                            # Write gap marker
                             gap = OrderedDict()
                             gap["detectedUtc"] = _utc_iso()
                             gap["storedLastEnd"] = state["lastEnd"]
@@ -330,32 +311,32 @@ def _run(
                                 datetime.now().strftime("%Y%m%d-%H%M%S")
                             )
                             (root / gap_name).write_text(json.dumps(gap, indent=2))
-                            if abort_on_gap:  # line 184
+                            if abort_on_gap:
                                 raise RuntimeError(
                                     "Aborting due to oplog gap (-AbortOnGap set)."
                                 )
 
-                    # Lines 188-191: track latest end timestamp
+                    # Track latest end timestamp
                     if (not new_last_end) or int(range_end["time"]) > int(new_last_end["time"]):
                         new_last_end = range_end
 
-                    # Lines 193-212: copy each .oplogs file
+                    # Copy each .oplogs file
                     for range_node in (range_.get("nodes") or []):
-                        node_host = range_node.get("id").split(":")[0]  # line 197
-                        rs_id = range_node.get("rsId")                  # line 198
-                        seg_dir = root / rs_id / "segments"             # line 199
-                        seg_dir.mkdir(parents=True, exist_ok=True)      # line 200
+                        node_host = range_node.get("id").split(":")[0]
+                        rs_id = range_node.get("rsId")
+                        seg_dir = root / rs_id / "segments"
+                        seg_dir.mkdir(parents=True, exist_ok=True)
 
-                        # Line 202: foreach ($RemoteFile in $RangeNode.logFiles)
                         log_files = range_node.get("logFiles") or []
                         for remote_file in log_files:
-                            local_name = os.path.basename(remote_file)  # line 203
-                            local_path = seg_dir / local_name           # line 204
+                            # Store each segment under its original OM filename so on-disk
+                            # lexical order matches chronological order during replay.
+                            local_name = os.path.basename(remote_file)
+                            local_path = seg_dir / local_name
                             config.write_host(
                                 f"  [{_now_hms()}]  scp {node_host}:{remote_file} -> {rs_id}/{local_name}",
                                 fg=config.CYAN,
-                            )  # line 205
-                            # Line 206: scp @SshOpts "user@host:remote" local 2>&1
+                            )
                             proc = subprocess.run(
                                 [
                                     "scp",
@@ -366,11 +347,10 @@ def _run(
                                 capture_output=True,
                                 text=True,
                             )
-                            if proc.returncode != 0:  # line 207
+                            if proc.returncode != 0:
                                 raise RuntimeError(
                                     f"scp failed for {remote_file} from {node_host} (exit {proc.returncode})"
                                 )
-                        # Lines 209-211
                         config.write_host(
                             f"  [{_now_hms()}]  {rs_id}: {len(log_files)} file(s)  "
                             f"end={int(range_end['time'])}:{int(range_end['inc'])}",
@@ -379,41 +359,37 @@ def _run(
 
                 # endregion
 
-                # region --- Finish and poll FINISHED --- (lines 217-231)
+                # region --- Finish and poll FINISHED ---
 
-                # Line 219
                 config.invoke_om_api_with_retry(
                     method="POST",
                     path=f"group/{group_id}/clusters/{cluster_id}/oplogSnapshot/{oplog_snapshot_id}/finish",
                 )
-                # Lines 220-221
                 deadline = datetime.now().timestamp() + timeout_minutes * 60
                 snap_state = ""
-                # Line 222: while ($SnapState -ne 'FINISHED')
                 while snap_state != "FINISHED":
-                    if datetime.now().timestamp() > deadline:  # line 223
+                    if datetime.now().timestamp() > deadline:
                         raise RuntimeError(
                             f"Oplog snapshot {oplog_snapshot_id} timed out waiting for FINISHED."
                         )
-                    if snap_state in ("FAILED", "FAILING"):  # line 224
+                    if snap_state in ("FAILED", "FAILING"):
                         raise RuntimeError(
                             f"Oplog snapshot {oplog_snapshot_id} entered {snap_state} after finish."
                         )
-                    time.sleep(poll_interval_sec)  # line 225
-                    # Line 226
+                    time.sleep(poll_interval_sec)
                     resp = config.invoke_om_api_with_retry(
                         path=f"group/{group_id}/clusters/{cluster_id}/oplogSnapshot/{oplog_snapshot_id}"
                     )
-                    snap_state = resp.get("state")  # line 227
+                    snap_state = resp.get("state")
                 config.write_host(
                     f"  [{_now_hms()}]  Job {job_seq}: FINISHED", fg=config.GREEN
-                )  # line 229
+                )
 
                 # endregion
 
-                job_completed = True  # line 233
+                job_completed = True
 
-                # Lines 236-243: persist state
+                # Persist state
                 new_state = OrderedDict()
                 new_state["snapshotTag"] = snapshot_tag
                 new_state["totalJobs"] = job_seq
@@ -422,37 +398,36 @@ def _run(
                 new_state["updatedUtc"] = _utc_iso()
                 state_json = json.dumps(new_state, indent=2)
                 state_file.write_text(state_json)
-                # Line 244: $State = $NewState | ConvertTo-Json | ConvertFrom-Json
+                # Round-trip through JSON so subsequent iterations compare against the
+                # same shape that was persisted.
                 state = json.loads(state_json)
 
-            except Exception as e:  # line 246: catch
-                # Line 247
+            except Exception as e:
                 config.write_host(
                     f"  [{_now_hms()}]  ERROR: {e}", fg=config.RED
                 )
-                # Line 248
                 if oplog_snapshot_id and not job_completed:
                     config.write_host(
                         f"  [{_now_hms()}]  Calling /fail on {oplog_snapshot_id} ...",
                         fg=config.YELLOW,
-                    )  # line 249
-                    try:  # line 250
+                    )
+                    try:
                         config.invoke_om_api_with_retry(
                             method="POST",
                             path=f"group/{group_id}/clusters/{cluster_id}/oplogSnapshot/{oplog_snapshot_id}/fail",
                         )
-                    except Exception as e2:  # line 252
+                    except Exception as e2:
                         config.write_host(
                             f"  [{_now_hms()}]  /fail also failed: {e2}", fg=config.RED
                         )
 
-            # Lines 258-260: sleep remainder of interval
+            # Sleep remainder of interval
             elapsed = (datetime.now() - iter_start).total_seconds()
             sleep = max(0, interval_sec - elapsed)
             if sleep > 0 and not stop_file.exists():
                 time.sleep(sleep)
 
-        # Lines 263-270: stop sentinel detected
+        # Stop sentinel detected
         config.write_host(
             "\n  Stop sentinel detected - exiting cleanly.", fg=config.YELLOW
         )
@@ -464,8 +439,8 @@ def _run(
         (root / ".stopped").write_text(json.dumps(stopped, indent=2))
         config.write_host(f"  Summary: {root / '.stopped'}", fg=config.GREEN)
 
-    finally:  # lines 272-274
-        # Stop-Transcript equivalent: flush/close logging handlers
+    finally:
+        # Flush/close logging handlers
         try:
             for h in list(logger.handlers):
                 h.flush()

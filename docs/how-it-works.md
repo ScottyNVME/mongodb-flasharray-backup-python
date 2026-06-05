@@ -241,7 +241,7 @@ T1 (snapshot)              Failure event              T2 (recovery target)
 
 The key invariant is where the per-shard oplog anchor is captured: **after the FlashArray PG snapshot commits, but before `$backupCursor` closes**. Because the cursor is still open at anchor read time, any oplog entry with `ts ≤ anchor` is guaranteed to be physically present on the snapshotted volume. The tailer then captures `ts > anchor` continuously. There is no window in which an operation can exist in neither the snapshot nor the tailer's output.
 
-Each tailer segment uses disjoint bounds (`{ ts: { $gt: lastTs, $lte: readTs } }`) so segments contain no duplicates and no gaps. Segments are named `oplog-NNNNNNNN-<t>-<i>.bson` so lexical sort equals capture order. `pitr/Invoke-OplogReplay.ps1` applies them per-shard via `mongorestore --oplogReplay`; `--oplogLimit` trims the final segment to an exact `TargetTimestamp` for sub-segment precision.
+Each tailer segment uses disjoint bounds (`{ ts: { $gt: lastTs, $lte: readTs } }`) so segments contain no duplicates and no gaps. Segments are named `oplog-NNNNNNNN-<t>-<i>.bson` so lexical sort equals capture order. `invoke-oplog-replay` applies them per-shard via `mongorestore --oplogReplay`; `--oplogLimit` trims the final segment to an exact `TargetTimestamp` for sub-segment precision.
 
 ---
 
@@ -255,7 +255,7 @@ The Ops Manager UI (**Backup → [cluster] → Snapshots**) shows completed snap
 
 ## `snapshotMetadata` — What to Store
 
-When state = `FINISHED`, the GET snapshot response includes `snapshotMetadata`. The sidecar file (`~/mongo-snapshots/<tag>.json`) persists this automatically. `Restore-MongoSnapshot.ps1` reads it at STEP 0 to call the OM valid restore target endpoint (`POST /group/{groupId}/clusters`) before any destructive action — OM checks shard count, MongoDB version, FCV, encryption, and `directoryPerDB` alignment between source and target clusters. Key fields:
+When state = `FINISHED`, the GET snapshot response includes `snapshotMetadata`. `new-mongo-snapshot` reads it to extract the snapshot oplog timestamp (`snapshotTimestamp.time`) and stores that as the `mongo:t1ts` tag on the FlashArray snapshot — the anchor PITR replay starts from. Snapshots here are always full (no `srcBackupName` chaining), and the restore validates its target at the storage layer (see Node-to-Volume Discovery, Step 5), so the remaining fields are informational. The full `snapshotMetadata` shape:
 
 | Field | Purpose |
 |---|---|
@@ -282,7 +282,7 @@ Tags `ClusterName`, `BackupTimestamp`, and `BackupType` are written inline at cr
 
 ## Node-to-Volume Discovery
 
-Every run of `New-MongoSnapshot.ps1` and `Restore-MongoSnapshot.ps1` resolves the full storage path for each node at runtime — no static configuration file maps nodes to arrays. The discovery chain runs in `Resolve-NodeToArrayVolumeMap` in `Config.ps1` and has five steps.
+Every run of `new-mongo-snapshot` and `restore-mongo-snapshot` resolves the full storage path for each node at runtime — no static configuration file maps nodes to arrays. The discovery chain runs in `resolve_node_to_array_volume_map` in `config.py` and has five steps.
 
 ### Step 1 — Find the mounted partition (`findmnt`)
 
@@ -313,19 +313,19 @@ Every Pure Storage volume has a SCSI page-80 serial embedded in the block device
 
 > **Fallback (mid-restore, volume not mounted):** if `findmnt` finds nothing at `/data/mongo`, the command instead scans all disks for any serial matching the FA format (`^[0-9a-fA-F]{20,}$`). Since each node has exactly one FA data volume, this is unambiguous.
 
-### Step 4 — Resolve serial to FlashArray volume (`Get-Pfa2Volume -Filter`)
+### Step 4 — Resolve serial to FlashArray volume (`GET /volumes?filter=serial=…`)
 
-```powershell
-Get-Pfa2Volume -Array $FA -ContextName 'sn1-x90r2-f07-27' -Filter "serial='1071BF0A0A224A050019BF3B'"
+```python
+fa.get_volumes(context_names=["sn1-x90r2-f07-27"], filter="serial='1071BF0A0A224A050019BF3B'")
 # → aen-mongo-01-data
 ```
 
-The single `Connect-Pfa2Array` gateway connection is used with `-ContextName` to query each fleet array in turn. The FA API matches the serial (stored uppercase) against its volume table. The first array that returns a volume wins; all other arrays are skipped. This is how the script identifies both which array owns the volume **and** what the volume is named — both required for the PG snapshot and volume overwrite operations.
+The client connects directly to each fleet array in turn (`context_names=[<array>]`). The FA REST API matches the serial (stored uppercase) against its volume table. The first array that returns a volume wins; all other arrays are skipped. This is how the script identifies both which array owns the volume **and** what the volume is named — both required for the PG snapshot and volume overwrite operations.
 
-### Step 5 — Verify protection group membership (`Get-Pfa2ProtectionGroupVolume`)
+### Step 5 — Verify protection group membership (`GET /protection-groups/volumes`)
 
-```powershell
-Get-Pfa2ProtectionGroupVolume -Array $FA -ContextName $array -ProtectionGroupName 'aen-mongodb-pg'
+```python
+fa.get_protection_groups_volumes(context_names=[array], group_names=["aen-mongodb-pg"])
 ```
 
 With the array and volume name known, the pre-flight check confirms the volume is a member of the protection group. If any data volume is missing from the PG, the script throws before any snapshot is attempted — preventing a partial snapshot that would be unrestorable.
@@ -358,7 +358,7 @@ Because the mapping is derived entirely from kernel and storage APIs at runtime,
 | `/manage` returns `THIRD_PARTY_CLUSTER_ALREADY_MANAGED` | Cluster was already registered | Not an error — cluster is active |
 | Backup agents stuck on `standby` in Deployment → Servers | No snapshot job assigned yet; agents activate when a snapshot is in progress | Expected with third-party backup |
 | `THIRD_PARTY_DISCOVERY_ERROR` from snapshot pre-flight | Third-party backup must be re-activated after any topology change | In OM UI: **Servers → select new node → enable Backup and Monitoring → Deploy Changes**, then retry |
-| Snapshot job stuck in `PENDING` | A prior run left a dangling job | Call `/fail`: `. ./Config.ps1; Invoke-OmApi -Method POST -Path "group/$GroupId/clusters/$ClusterId/snapshot/<id>/fail"`. Poll until `FAILED`, then re-run. |
+| Snapshot job stuck in `PENDING` | A prior run left a dangling job | Call `/fail` via the OM API — e.g. `config.invoke_om_api(method="POST", path="group/{GroupId}/clusters/{ClusterId}/snapshot/<id>/fail")`. Poll until `FAILED`, then re-run. |
 
 ---
 

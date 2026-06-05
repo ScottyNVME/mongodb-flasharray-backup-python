@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
-"""Stop-OplogTailer.ps1 -> stop_oplog_tailer.py (faithful 1:1 translation).
-
-Stop the continuous oplog tailer started by Start-OplogTailer.ps1.
+"""Stop the continuous oplog tailer.
 
 Writes a .stop sentinel file that the tailer checks at the top of each iteration. Waits up
-to $WaitSec for the tailer to write its .stopped marker (which contains per-shard final
+to --wait-sec for the tailer to write its .stopped marker (which contains per-shard final
 lastTs and segment counts). Captures a T2-mark count file via mongos for the replay range
-assertion. Prints a summary suitable for handing off to Invoke-OplogReplay.ps1.
+assertion. Prints a summary suitable for handing off to the replay step.
 
 Idempotent: if no tailer is running for this tag, exits with a notice and a non-fatal exit
-code. The companion Start-OplogTailer.ps1 script removes .stop, .started and .stopped
+code. The companion start command removes .stop, .started and .stopped
 atomically on its next start, so re-stopping a stale tag is safe.
 """
 
-# Maps original: #Requires -Version 7 / param(...) / . "$PSScriptRoot/Config.ps1"
 import json
 import os
 import re
@@ -27,12 +24,11 @@ import typer
 from .. import config
 
 
-# Maps original param block: [ValidatePattern('^om-\d{8}-\d{6}$')]$SnapshotTag
+# Enforce the ^om-\d{8}-\d{6}$ pattern on the snapshot tag.
 _SNAPSHOT_TAG_RE = re.compile(r"^om-\d{8}-\d{6}$")
 
 
 def _validate_snapshot_tag(value: str) -> str:
-    # [ValidatePattern('^om-\d{8}-\d{6}$')] enforcement
     if value is None or not _SNAPSHOT_TAG_RE.match(value):
         raise typer.BadParameter(
             "The argument does not match the \"^om-\\d{8}-\\d{6}$\" pattern."
@@ -41,7 +37,7 @@ def _validate_snapshot_tag(value: str) -> str:
 
 
 def _proc_is_running(pid: int) -> bool:
-    # Maps: Get-Process -Id <pid> -ErrorAction SilentlyContinue (return $null if not running)
+    # Return True if a process with this pid exists, False otherwise.
     try:
         os.kill(pid, 0)
         return True
@@ -69,12 +65,9 @@ def _run(
         ["loadtest", "payload"], "--baseline-collections"
     ),
 ) -> None:
-    # Equivalent of dot-sourcing Config.ps1: load config first so running without .env throws.
+    # Load config first so running without .env throws.
     cfg = config.load_config()
 
-    # $ErrorActionPreference = 'Stop'  -> Python exceptions propagate by default.
-
-    # $Root / $StartedFile / $StopFile / $StoppedFile / $StateFile
     home = Path(os.path.expanduser("~"))
     root = home / "mongo-oplog-stream" / snapshot_tag
     started_file = root / ".started"
@@ -82,7 +75,7 @@ def _run(
     stopped_file = root / ".stopped"
     state_file = root / "state.json"
 
-    # if (-not (Test-Path $Root)) { ... return }
+    # Nothing to stop if the state directory does not exist.
     if not root.exists():
         config.write_host(
             f"  No tailer state directory found at {root} - nothing to stop.",
@@ -90,7 +83,6 @@ def _run(
         )
         return
 
-    # Write-Host "`n=== Stopping Oplog Tailer for snapshot $SnapshotTag ===" -ForegroundColor Yellow
     config.write_host(
         f"\n=== Stopping Oplog Tailer for snapshot {snapshot_tag} ===",
         fg=config.YELLOW,
@@ -113,15 +105,14 @@ def _run(
             fg=config.DARK_YELLOW,
         )
 
-    # Touch the stop sentinel. Use New-Item with -Force so re-stopping is idempotent.
-    # $null = New-Item -ItemType File -Path $StopFile -Force
+    # Touch the stop sentinel. Overwriting (rather than failing if present) keeps re-stopping
+    # idempotent.
     stop_file.parent.mkdir(parents=True, exist_ok=True)
     stop_file.write_text("")
     config.write_host(f"  Stop sentinel written: {stop_file}", fg=config.GREEN)
 
-    # Wait for the tailer to acknowledge by writing .stopped. We wait up to $WaitSec, polling
+    # Wait for the tailer to acknowledge by writing .stopped. We wait up to wait_sec, polling
     # at 1s intervals.
-    # $Deadline = (Get-Date).AddSeconds($WaitSec)
     deadline = time.monotonic() + wait_sec
     acked = False
     while time.monotonic() < deadline:
@@ -139,7 +130,6 @@ def _run(
                     fg=config.YELLOW,
                 )
                 break
-        # Start-Sleep -Milliseconds 1000
         time.sleep(1.0)
 
     if acked:
@@ -151,14 +141,11 @@ def _run(
         )
 
     # Summarize per-shard final state by reading state.json directly (authoritative).
-    # Read global state.json written by Start-OplogTailer.ps1 (OM API approach).
     global_state = None
     if state_file.exists():
         global_state = json.loads(state_file.read_text())
 
-    # Write-Host "`n  Per-RS segment summary:" -ForegroundColor Cyan
     config.write_host("\n  Per-RS segment summary:", fg=config.CYAN)
-    # $ShardDirs = @(Get-ChildItem -Path $Root -Directory ...)
     try:
         shard_dirs = sorted(
             [p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name
@@ -171,42 +158,36 @@ def _run(
         seg_dir = sh / "segments"
         segments = []
         if seg_dir.exists():
-            # Get-ChildItem -Filter '*.oplogs' -File
             try:
                 segments = [
                     p for p in seg_dir.iterdir() if p.is_file() and p.name.endswith(".oplogs")
                 ]
             except OSError:
                 segments = []
-        # $Bytes = ($Segments | Measure-Object -Property Length -Sum).Sum
         b = 0
         for seg in segments:
             b += seg.stat().st_size
-        # if (-not $Bytes) { $Bytes = 0L }
         if not b:
             b = 0
         total_segments += len(segments)
         total_bytes += b
-        # "    {0,-16}  segments={1,-4}  bytes={2}"
         config.write_host(
             f"    {sh.name:<16}  segments={len(segments):<4}  bytes={b}",
             fg=None,
         )
 
-    # $Now = Get-Date
     now = datetime.now().astimezone()
     if global_state and global_state.get("lastEnd"):
-        # Keep $LastEndUtc as Kind=Utc; casting through string produces Kind=Local which inflates lag.
+        # Keep last_end_utc tz-aware as UTC; comparing against a naive/local value would
+        # inflate the reported lag.
         last_end = global_state.get("lastEnd")
         last_end_utc = datetime.fromtimestamp(int(last_end.get("time")), tz=timezone.utc)
-        # $LastEndIso = $LastEndUtc.ToString('o')  -> ISO-8601 round-trip format
+        # ISO-8601 round-trip format
         last_end_iso = last_end_utc.strftime("%Y-%m-%dT%H:%M:%S.%f0Z")
-        # $LagSec = [math]::Round((Now.ToUniversalTime() - LastEndUtc).TotalSeconds, 1)
         lag_sec = round(
             (now.astimezone(timezone.utc) - last_end_utc).total_seconds(), 1
         )
         config.write_host("", fg=None)
-        # "  Last oplog end : {0}:{1}  ({2}, lagSec={3})"
         config.write_host(
             f"  Last oplog end : {int(last_end.get('time'))}:{int(last_end.get('inc'))}  "
             f"({last_end_iso}, lagSec={lag_sec})",
@@ -232,7 +213,6 @@ def _run(
         try:
             db_counts = {}
             for coll in baseline_collections:
-                # $Eval = "db.getSiblingDB(`"$BaselineDatabase`").$Coll.countDocuments()"
                 eval_str = (
                     f'db.getSiblingDB("{baseline_database}").{coll}.countDocuments()'
                 )
@@ -243,7 +223,7 @@ def _run(
                     max_attempts=5,
                     context=f"T2-mark {baseline_database}.{coll}",
                 )
-                # if ($Raw -notmatch '^\d+$') { throw ... }
+                # The count output must be a bare integer; anything else is unparseable.
                 if not re.search(r"^\d+$", raw if raw is not None else "", re.MULTILINE):
                     raise RuntimeError(
                         f"Unparseable count for {baseline_database}.{coll}: '{raw}'"
@@ -253,7 +233,6 @@ def _run(
                     f"    {baseline_database}.{coll} = {db_counts[coll]}",
                     fg=config.GREEN,
                 )
-            # $T2 = [ordered]@{ snapshotTag; capturedUtc; counts = @{ db = $DbCounts } }
             t2 = {
                 "snapshotTag": snapshot_tag,
                 "capturedUtc": datetime.now(timezone.utc).strftime(
@@ -262,10 +241,9 @@ def _run(
                 "counts": {baseline_database: db_counts},
             }
             t2_path = root / "t2-mark.json"
-            # $T2 | ConvertTo-Json -Depth 5 | Set-Content $T2Path
             t2_path.write_text(json.dumps(t2, indent=2))
             config.write_host(f"  T2 mark written: {t2_path}", fg=config.GREEN)
-        except Exception as e:  # noqa: BLE001 - mirrors PS catch { ... } non-fatal
+        except Exception as e:  # noqa: BLE001 - T2 mark capture is non-fatal
             config.write_host(
                 f"  WARNING: T2 mark capture failed - replay will skip the range check "
                 f"unless you write t2-mark.json manually. ({e})",
@@ -274,7 +252,7 @@ def _run(
 
     config.write_host("", fg=None)
     config.write_host(
-        f"  Replay with: pwsh ./pitr/Invoke-OplogReplay.ps1 -SnapshotTag '{snapshot_tag}'",
+        f"  Replay with: invoke-oplog-replay --snapshot-tag '{snapshot_tag}'",
         fg=config.CYAN,
     )
 

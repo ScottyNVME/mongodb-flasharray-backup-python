@@ -1,8 +1,8 @@
-"""Parity unit tests for config.py — asserting the Python port matches Config.ps1 semantics.
+"""Unit tests for config.py.
 
 These cover the pure logic that needs no live cluster/array: Digest hashing, the .env loader, script
 locking (incl. stale-PID reclaim and the O_EXCL race), the parallel runner's failure aggregation, and the
-SCSI-serial selection logic of Resolve-NodeToArrayVolumeMap.
+SCSI-serial selection logic of resolve_node_to_array_volume_map.
 """
 
 import os
@@ -18,16 +18,16 @@ from mongodb_flasharray_backup import config  # noqa: E402
 
 
 # --------------------------------------------------------------------------------------------------------
-# Get-MD5Hash parity
+# MD5 hashing
 # --------------------------------------------------------------------------------------------------------
 def test_get_md5_hash_known_vectors():
-    # RFC 1321 / well-known MD5 hex digests (lowercase, like Config.ps1's Get-MD5Hash).
+    # RFC 1321 / well-known MD5 hex digests (lowercase).
     assert config.get_md5_hash("") == "d41d8cd98f00b204e9800998ecf8427e"
     assert config.get_md5_hash("abc") == "900150983cd24fb0d6963f7d28e17f72"
 
 
 # --------------------------------------------------------------------------------------------------------
-# .env loader parity (Get-EnvVar + custom parser)
+# .env loader
 # --------------------------------------------------------------------------------------------------------
 def _write_full_env(p: Path):
     p.write_text(
@@ -90,7 +90,7 @@ def test_load_config_missing_file_raises(tmp_path):
 
 
 # --------------------------------------------------------------------------------------------------------
-# New-ScriptLock / Remove-ScriptLock parity
+# Script locking
 # --------------------------------------------------------------------------------------------------------
 def test_lock_acquire_and_live_holder_blocks(tmp_path):
     lock = str(tmp_path / "x.lock")
@@ -125,7 +125,7 @@ def test_lock_unparseable_pid_raises(tmp_path):
 
 
 # --------------------------------------------------------------------------------------------------------
-# Invoke-ParallelOrThrow parity
+# invoke_parallel_or_throw
 # --------------------------------------------------------------------------------------------------------
 def test_parallel_success_passthrough():
     items = [1, 2, 3]
@@ -159,7 +159,7 @@ def test_parallel_uses_key_when_no_node():
 
 
 # --------------------------------------------------------------------------------------------------------
-# Resolve-NodeToArrayVolumeMap serial selection (subprocess + _fa mocked)
+# resolve_node_to_array_volume_map serial selection (subprocess + _fa mocked)
 # --------------------------------------------------------------------------------------------------------
 class _FakeVol:
     def __init__(self, name):

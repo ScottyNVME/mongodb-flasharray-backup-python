@@ -1,16 +1,14 @@
 ###############################################################################################################################
-# Restore-MongoSnapshot - Pure Storage FlashArray + MongoDB Ops Manager Third-Party Backup API
-#
-# Faithful 1:1 Python port of reference/Restore-MongoSnapshot.ps1.
+# Restore Mongo Snapshot - Pure Storage FlashArray + MongoDB Ops Manager Third-Party Backup API
 #
 # Restores a MongoDB 8.0 sharded cluster from a set of FlashArray volume snapshots taken by
-# New-MongoSnapshot.ps1. The restore overwrites each node's data volume in place,
+# the snapshot workflow. The restore overwrites each node's data volume in place,
 # preserving the existing pRDM/LUN mapping - no vSphere reconfiguration required.
 #
-#    A single Connect-Pfa2Array call targets the gateway array (sn1-x90r2-f06-27). Cluster nodes
+#    A single connection targets the gateway array (sn1-x90r2-f06-27). Cluster nodes
 #    and FlashArray context names and volume mappings are discovered at runtime from Ops Manager
 #    and via SCSI serial numbers. Each volume overwrite is routed to the correct array by passing
-#    -ContextName with that array's short name. The target snapshot is located by querying the
+#    that array's short name as the context name. The target snapshot is located by querying the
 #    FlashArray tag catalog across all context arrays (ClusterName + BackupTimestamp), rather than
 #    by constructing a name pattern.
 #
@@ -40,8 +38,7 @@
 
 from __future__ import annotations
 
-# Original header maps lines 1-13: param() block + dot-source of Config.ps1.
-# Dot-sourcing Config.ps1 is realized here via `from . import config` + config.load_config() called
+# Configuration is loaded via `from . import config` + config.load_config() called
 # as the FIRST statement of the worker (_run).
 
 import logging
@@ -56,19 +53,18 @@ import typer
 
 from . import config
 
-# Import models for FlashArray (py-pure-client). Mirrors `Import-Module PureStoragePowerShellSDK2` (line 65).
 # FlashArray access is via the direct-REST client (config.connect_fa / fa_rest.py).
 
 
 app = typer.Typer(add_completion=False)
 
 
-# Original line 4: [ValidatePattern('^om-\d{8}-\d{6}$')] on -SnapshotTag.
+# Validates --snapshot-tag against the expected om-<date>-<time> format.
 _SNAPSHOT_TAG_RE = re.compile(r"^om-\d{8}-\d{6}$")
 
 
 def _validate_snapshot_tag(value: str) -> str:
-    """typer callback mapping [ValidatePattern('^om-\\d{8}-\\d{6}$')]."""
+    """typer callback validating the snapshot tag against '^om-\\d{8}-\\d{6}$'."""
     if value is None or not _SNAPSHOT_TAG_RE.match(value):
         raise typer.BadParameter(
             "Cannot validate argument on parameter 'SnapshotTag'. "
@@ -78,7 +74,6 @@ def _validate_snapshot_tag(value: str) -> str:
 
 
 def _run(
-    # Original param() block (lines 2-12)
     snapshot_tag: str = typer.Option(
         ...,
         "--snapshot-tag",
@@ -101,34 +96,31 @@ def _run(
         help="skip STEP 8 entirely; otherwise STEP 8 is fail-hard on unparseable counts",
     ),
 ) -> None:
-    # Python equivalent of dot-sourcing Config.ps1 (original line 13). Must be FIRST so running without
-    # .env throws like the original (but --help still works because typer short-circuits before this).
+    # Load configuration. Must be FIRST so running without
+    # .env throws (but --help still works because typer short-circuits before this).
     config.load_config()
 
-    # Original line 70: $ErrorActionPreference = 'Stop'. In Python uncaught exceptions already terminate;
-    # no analogue needed. (Comment retained for traceability.)
-
-    # region --- Configuration --- (original lines 72-81)
+    # region --- Configuration ---
     wait_timeout_sec = 600   # Max seconds to wait for cluster to stabilize
     poll_interval_sec = 10   # Seconds between readiness polls
     proc_wait_sec = 30       # Max seconds to wait for mongod TERM before SIGKILL
     # endregion
 
-    # Concurrency lock with stale-PID detection (original lines 83-85).
+    # Concurrency lock with stale-PID detection.
     lock_path = str(Path(os.path.expanduser("~")) / ".mongo-restore.lock")
     config.new_script_lock(lock_path)
 
-    # Logging handle so the finally-block can detach handlers (analogue of Stop-Transcript).
+    # Logging handle so the finally-block can detach handlers.
     transcript_handlers: list[logging.Handler] = []
     transcript_logger = logging.getLogger("restore_transcript")
 
-    try:  # original outer try (line 87) - paired with finally that removes the lock (lines 654-657)
+    try:  # outer try - paired with finally that removes the lock
 
-        # Audit log / Start-Transcript (original lines 89-93).
+        # Audit log.
         log_dir = Path(os.path.expanduser("~")) / "mongo-restore-logs"
-        log_dir.mkdir(parents=True, exist_ok=True)  # New-Item -ItemType Directory -Force
+        log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"restore-{snapshot_tag}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
-        # Start-Transcript -Path $LogPath -Append: configure a logger writing to BOTH the file and console.
+        # Configure a logger writing to BOTH the file and console.
         transcript_logger.setLevel(logging.INFO)
         transcript_logger.propagate = False
         _fh = logging.FileHandler(str(log_path), mode="a")
@@ -140,19 +132,18 @@ def _run(
         transcript_logger.addHandler(_sh)
         transcript_handlers = [_fh, _sh]
 
-        try:  # original inner try (line 95) - paired with finally that Stop-Transcript (lines 650-652)
+        try:  # inner try - paired with finally that detaches the log handlers
 
-            # original line 97
             start = datetime.now()
 
-            # region --- STEP 0: Pre-flight --- (original lines 99-236)
+            # region --- STEP 0: Pre-flight ---
             config.write_host("\n=== STEP 0: Pre-flight ===", fg=config.YELLOW)
 
-            # Discover cluster nodes from Ops Manager (fallback: CLUSTER_NODES in .env). (lines 103-105)
+            # Discover cluster nodes from Ops Manager (fallback: CLUSTER_NODES in .env).
             config.write_host("  Discovering cluster nodes...", fg=config.CYAN)
             cluster_nodes = config.get_cluster_nodes()
 
-            # Verify SSH connectivity to every node before stopping anything. (lines 107-114)
+            # Verify SSH connectivity to every node before stopping anything.
             for node in cluster_nodes:
                 proc = subprocess.run(
                     ["ssh", *config.SSH_OPTS, f"{config.CFG.SshUser}@{node}", "true"],
@@ -166,16 +157,16 @@ def _run(
                     )
                 config.write_host(f"  SSH OK: {node}", fg=config.CYAN)
 
-            # Connect to the gateway once. (lines 116-118)
+            # Connect to the gateway once.
             fa = config.connect_fa()
             config.write_host(f"  Connected to gateway: {config.CFG.FaEndpoint}", fg=config.GREEN)
 
-            # Resolve FA context names from live fleet discovery. (lines 120-125)
+            # Resolve FA context names from live fleet discovery.
             fa_context_names = config.resolve_fa_context_names(fa, config.CFG.ProtectionGroupName)
             snap_name = f"{config.CFG.ProtectionGroupName}.{snapshot_tag}"
             snap_tags = config.get_fa_snapshot_tags(fa, fa_context_names, snap_name)
 
-            # mongo:volumes records the volume names that were part of this snapshot. (lines 127-137)
+            # mongo:volumes records the volume names that were part of this snapshot.
             if snap_tags.get("mongo:volumes"):
                 expected_snap_count = len(snap_tags["mongo:volumes"].split(","))
                 config.write_host(
@@ -190,7 +181,7 @@ def _run(
                     fg=config.YELLOW,
                 )
 
-            # Verify the target snapshot exists on all context arrays via the gateway. (lines 139-163)
+            # Verify the target snapshot exists on all context arrays via the gateway.
             snap_check: list = []
             for ctx_name in fa_context_names:
                 filter_str = f"name='{config.CFG.ProtectionGroupName}.{snapshot_tag}'"
@@ -211,7 +202,7 @@ def _run(
                         time.sleep(5)
                 if snap:
                     snap_check.append(snap)
-                    # $Snap.Name on a (possibly multi-item) result: PS pipes a single object here; take first.
+                    # Result may be multi-item; take the first for the name to report.
                     config.write_host(f"  Snapshot found: {snap[0].name} on {ctx_name}", fg=config.CYAN)
                 else:
                     config.write_host(
@@ -225,7 +216,7 @@ def _run(
                 )
             config.write_host(f"  All {len(snap_check)} snapshots confirmed.", fg=config.GREEN)
 
-            # Discover which FA volume backs /data/mongo on each node via SCSI serial. (lines 165-168)
+            # Discover which FA volume backs /data/mongo on each node via SCSI serial.
             config.write_host("  Discovering node-to-volume mappings via SCSI serial...", fg=config.CYAN)
             node_volume_map = config.resolve_node_to_array_volume_map(
                 fa,
@@ -235,7 +226,7 @@ def _run(
                 fa_context_names,
             )
 
-            # Guard: every expected volume must have been discovered. (lines 170-176)
+            # Guard: every expected volume must have been discovered.
             if len(node_volume_map) != expected_snap_count:
                 raise RuntimeError(
                     f"SCSI volume discovery found {len(node_volume_map)} of {expected_snap_count} "
@@ -243,7 +234,7 @@ def _run(
                     "are reachable and their data volumes are presented."
                 )
 
-            # Verify every discovered node volume is present + size matches. (lines 177-207)
+            # Verify every discovered node volume is present + size matches.
             config.write_host(
                 f"  Verifying all node volumes are present in snapshot '{snapshot_tag}'...",
                 fg=config.CYAN,
@@ -253,7 +244,7 @@ def _run(
                 volume_name = entry["VolumeName"]
                 member_snap = f"{config.CFG.ProtectionGroupName}.{snapshot_tag}.{volume_name}"
                 vol_snap = None
-                # for ($attempt = 1; $attempt -le 3 -and -not $VolSnap; $attempt++)
+                # Retry up to 3 times for the member snapshot to appear.
                 attempt = 1
                 while attempt <= 3 and not vol_snap:
                     vs_items = config._fa(
@@ -270,7 +261,7 @@ def _run(
                         f"{short_name} - aborting before any changes."
                     )
                 live_vol = None
-                # for ($attempt = 1; $attempt -le 3 -and -not $LiveVol; $attempt++) with -ErrorAction Stop + retry
+                # Retry up to 3 times to read the live volume, re-raising on the final failure.
                 attempt = 1
                 while attempt <= 3 and not live_vol:
                     try:
@@ -279,7 +270,7 @@ def _run(
                             allow_error=False,
                         )
                         live_vol = lv_items[0] if lv_items else None
-                    except Exception:  # noqa: BLE001 - faithful to PS catch
+                    except Exception:  # noqa: BLE001 - broad catch to drive the retry loop
                         if attempt < 3:
                             time.sleep(5)
                         else:
@@ -297,7 +288,7 @@ def _run(
                 )
             config.write_host("  All node volume members confirmed in snapshot.", fg=config.GREEN)
 
-            # Discover the underlying block device backing /data/mongo on each node. (lines 209-223)
+            # Discover the underlying block device backing /data/mongo on each node.
             node_device: dict[str, str] = {}
             for node in cluster_nodes:
                 cmd = (
@@ -319,7 +310,7 @@ def _run(
                 node_device[node] = disk
                 config.write_host(f"  Device on {node}: /dev/{disk}", fg=config.CYAN)
 
-            # Destructive-operation confirmation. (lines 225-234)
+            # Destructive-operation confirmation.
             if not force:
                 config.write_host(
                     "\n  WARNING: This will OVERWRITE the live data volumes on:", fg=config.RED
@@ -334,10 +325,10 @@ def _run(
                     raise RuntimeError("Confirmation did not match. Aborting.")
             # endregion
 
-            # region --- STEP 1: Stop automation agents --- (original lines 238-255)
+            # region --- STEP 1: Stop automation agents ---
             config.write_host("\n=== STEP 1: Stopping automation agents ===", fg=config.YELLOW)
 
-            # Invoke-ParallelOrThrow inline block (lines 242-253).
+            # Worker run in parallel across nodes.
             def _step1_stop_agent(node):
                 user = config.CFG.SshUser
                 opts = config.SSH_OPTS
@@ -355,17 +346,17 @@ def _run(
             config.invoke_parallel_or_throw(cluster_nodes, _step1_stop_agent, "Stop automation agents")
             # endregion
 
-            # region --- STEP 2: Force-stop mongod/mongos --- (original lines 257-297)
+            # region --- STEP 2: Force-stop mongod/mongos ---
             config.write_host("\n=== STEP 2: Stopping mongod/mongos ===", fg=config.YELLOW)
 
-            # Invoke-ParallelOrThrow inline block (lines 264-295).
+            # Worker run in parallel across nodes.
             def _step2_stop_mongo(node):
                 user = config.CFG.SshUser
                 opts = config.SSH_OPTS
                 max_wait = proc_wait_sec
 
-                # Original here-string ($StopCmd, lines 270-288). In PS the here-string interpolates $Max
-                # and escapes `$(seq ...). The literal remote text uses $(seq 1 <Max>) and bare $i etc.
+                # Remote shell script: only max_wait is interpolated into $(seq 1 <Max>); the
+                # remaining shell variables ($i etc.) are evaluated on the remote host.
                 stop_cmd = (
                     "set -e\n"
                     "sudo pkill -TERM -x mongos 2>/dev/null || true\n"
@@ -385,7 +376,6 @@ def _run(
                     "fi\n"
                     'echo "forced-stop"; exit 0'
                 )
-                # ssh @Opts "${User}@${Node}" $StopCmd 2>&1
                 proc = subprocess.run(
                     ["ssh", *opts, f"{user}@{node}", stop_cmd],
                     capture_output=True,
@@ -400,14 +390,14 @@ def _run(
             config.invoke_parallel_or_throw(cluster_nodes, _step2_stop_mongo, "Stop mongod/mongos")
             # endregion
 
-            # region --- STEP 3: Unmount /data/mongo (idempotent) --- (original lines 299-332)
+            # region --- STEP 3: Unmount /data/mongo (idempotent) ---
             config.write_host("\n=== STEP 3: Unmounting /data/mongo ===", fg=config.YELLOW)
 
-            # Invoke-ParallelOrThrow inline block (lines 303-330).
+            # Worker run in parallel across nodes.
             def _step3_unmount(node):
                 user = config.CFG.SshUser
                 opts = config.SSH_OPTS
-                # Original single-quoted here-string (lines 310-323): no interpolation.
+                # Remote shell script: a fixed command with no interpolation.
                 cmd = (
                     "if mountpoint -q /data/mongo; then\n"
                     "  if sudo umount /data/mongo; then\n"
@@ -430,7 +420,7 @@ def _run(
                 out = (proc.stdout + proc.stderr).strip()
                 if proc.returncode != 0:
                     return {"Node": node, "Success": False, "Message": f"umount failed: {out}"}
-                # Write-Host "  ${Node}: $($Out -split "`n" | Select-Object -First 1)"
+                # Report only the first line of the output.
                 first_line = out.split("\n")[0] if out else ""
                 config.write_host(f"  {node}: {first_line}", fg=config.GREEN)
                 return {"Node": node, "Success": True, "Message": out}
@@ -438,7 +428,7 @@ def _run(
             config.invoke_parallel_or_throw(cluster_nodes, _step3_unmount, "Unmount /data/mongo")
             # endregion
 
-            # region --- STEP 4: Overwrite FlashArray volumes from snapshots (sequential) --- (lines 334-377)
+            # region --- STEP 4: Overwrite FlashArray volumes from snapshots (sequential) ---
             config.write_host(
                 f"\n=== STEP 4: Restoring FlashArray volumes from '{snapshot_tag}' ===",
                 fg=config.YELLOW,
@@ -453,7 +443,7 @@ def _run(
 
                 overwrite_ok = False
                 last_err = None
-                # for ($attempt = 1; $attempt -le 3 -and -not $OverwriteOk; $attempt++)
+                # Retry the overwrite up to 3 times.
                 attempt = 1
                 while attempt <= 3 and not overwrite_ok:
                     try:
@@ -466,7 +456,7 @@ def _run(
                             f"  Overwriting {volume_name} on {short_name} <- {snap_name} ...",
                             fg=config.CYAN,
                         )
-                        # New-Pfa2Volume -Name v -SourceName s -Overwrite $true -ErrorAction Stop
+                        # Overwrite the live volume in place from the snapshot member.
                         config._fa(
                             fa.post_volumes(
                                 names=[volume_name],
@@ -478,7 +468,7 @@ def _run(
                         )
                         config.write_host(f"  Restored: {volume_name}", fg=config.GREEN)
                         overwrite_ok = True
-                    except Exception as e:  # noqa: BLE001 - faithful to PS catch
+                    except Exception as e:  # noqa: BLE001 - broad catch to drive the retry loop
                         last_err = str(e)
                         config.write_host(f"  Attempt {attempt} failed: {last_err}", fg=config.RED)
                         if attempt < 3:
@@ -499,19 +489,20 @@ def _run(
                 )
             # endregion
 
-            # region --- STEP 5: Rescan LUN + remount /data/mongo --- (original lines 379-439)
+            # region --- STEP 5: Rescan LUN + remount /data/mongo ---
             config.write_host(
                 "\n=== STEP 5: Rescanning LUN and remounting /data/mongo ===", fg=config.YELLOW
             )
 
-            # Invoke-ParallelOrThrow inline block (lines 383-437).
+            # Worker run in parallel across nodes.
             def _step5_rescan_mount(node):
                 user = config.CFG.SshUser
                 opts = config.SSH_OPTS
                 devices = node_device
                 disk = devices[node]  # e.g. 'sdb'
 
-                # Original here-string ($Cmd, lines 401-426). It interpolates $Disk and escapes the rest.
+                # Remote shell script: only the disk name is interpolated; the rest of the
+                # shell variables are evaluated on the remote host.
                 cmd = (
                     "set -e\n"
                     f"DISK={disk}\n"
@@ -549,7 +540,7 @@ def _run(
                 out = (proc.stdout + proc.stderr)
                 if proc.returncode != 0:
                     return {"Node": node, "Success": False, "Message": f"rescan/mount failed: {out.strip()}"}
-                # foreach ($Line in $Out): PS iterates the captured lines.
+                # Surface the captured device= and WARN advisory lines.
                 for line in out.splitlines():
                     if re.match(r"^(WARN|device=)", line):
                         config.write_host(f"    {node}: {line}", fg=config.DARK_YELLOW)
@@ -559,10 +550,10 @@ def _run(
             config.invoke_parallel_or_throw(cluster_nodes, _step5_rescan_mount, "Rescan + mount")
             # endregion
 
-            # region --- STEP 6: Start automation agents --- (original lines 441-460)
+            # region --- STEP 6: Start automation agents ---
             config.write_host("\n=== STEP 6: Starting automation agents ===", fg=config.YELLOW)
 
-            # Invoke-ParallelOrThrow inline block (lines 445-456).
+            # Worker run in parallel across nodes.
             def _step6_start_agent(node):
                 user = config.CFG.SshUser
                 opts = config.SSH_OPTS
@@ -585,12 +576,12 @@ def _run(
             )
             # endregion
 
-            # region --- STEP 7: Wait for cluster to stabilize --- (original lines 462-543)
+            # region --- STEP 7: Wait for cluster to stabilize ---
             config.write_host("\n=== STEP 7: Waiting for cluster to stabilize ===", fg=config.YELLOW)
 
-            expected_shards = None  # line 472
+            expected_shards = None
 
-            deadline = time.monotonic() + wait_timeout_sec  # (Get-Date).AddSeconds($WaitTimeoutSec)
+            deadline = time.monotonic() + wait_timeout_sec
             ready = False
 
             while not ready:
@@ -603,7 +594,7 @@ def _run(
                     fg=config.CYAN,
                 )
 
-                # Ping mongos (lines 485-491).
+                # Ping mongos.
                 ping_remote = (
                     f"{config.CFG.MongoshPath} --quiet --eval 'db.adminCommand({{ping:1}}).ok' "
                     f"mongodb://{config.CFG.MongosHost}:{config.CFG.MongosPort} 2>/dev/null"
@@ -620,7 +611,7 @@ def _run(
                     )
                     continue
 
-                # Read the current shard count (lines 493-501).
+                # Read the current shard count.
                 sc_remote = (
                     f"{config.CFG.MongoshPath} --quiet --eval "
                     f"'db.adminCommand({{listShards:1}}).shards.length' "
@@ -631,7 +622,7 @@ def _run(
                     capture_output=True,
                     text=True,
                 )
-                # [int](...): PS casts the raw stdout to int.
+                # Parse the raw stdout as an int.
                 shard_count = int(sc_proc.stdout.strip())
                 if expected_shards is None:
                     expected_shards = shard_count
@@ -647,7 +638,7 @@ def _run(
                     )
                     continue
 
-                # Per-shard hello() health check via temp .js on the remote host. (lines 508-537)
+                # Per-shard hello() health check via temp .js on the remote host.
                 health_script = (
                     "const shards = db.adminCommand({listShards:1}).shards;\n"
                     "let ok = 0;\n"
@@ -665,7 +656,7 @@ def _run(
                     "print(ok);\n"
                 )
                 temp_js = f"/tmp/mongo_health_{snapshot_tag}.js"
-                # $HealthScript | ssh @SshOpts "${SshUser}@${MongosHost}" "cat > $TempJs"
+                # Pipe the health script to a temp .js file on the mongos host.
                 subprocess.run(
                     ["ssh", *config.SSH_OPTS, f"{config.CFG.SshUser}@{config.CFG.MongosHost}", f"cat > {temp_js}"],
                     input=health_script,
@@ -698,7 +689,7 @@ def _run(
                 ready = True
             # endregion
 
-            # region --- STEP 8: Verify data --- (original lines 545-638)
+            # region --- STEP 8: Verify data ---
             if skip_verification:
                 config.write_host(
                     "\n=== STEP 8: Verification SKIPPED (-SkipVerification) ===", fg=config.DARK_YELLOW
@@ -708,8 +699,8 @@ def _run(
                 config.write_host("  Waiting 10s for shard metadata to propagate...", fg=config.DARK_GRAY)
                 time.sleep(10)
 
-                # Build baseline from snapshot tags. (lines 559-565)
-                # $SnapTags was loaded in STEP 0; reuse it here without a second FA API call.
+                # Build baseline from snapshot tags.
+                # snap_tags was loaded in STEP 0; reuse it here without a second FA API call.
                 baseline = None
                 if snap_tags.get("mongo:preSnap") or snap_tags.get("mongo:postSnap"):
                     import json as _json
@@ -718,7 +709,7 @@ def _run(
                         "postSnap": _json.loads(snap_tags["mongo:postSnap"]) if snap_tags.get("mongo:postSnap") else None,
                     }
 
-                # function Get-VerifyCount (lines 567-577)
+                # Count documents in a collection via mongosh, failing hard on unparseable output.
                 def get_verify_count(db: str, coll: str) -> int:
                     eval_str = f'db.getSiblingDB("{db}").{coll}.countDocuments()'
                     raw = config.invoke_mongosh_js(
@@ -741,7 +732,7 @@ def _run(
                 )
 
                 if baseline:
-                    # function Get-BaselineCount (lines 590-597). Returns None if missing, else long.
+                    # Look up a baseline count from a tag container; returns None if missing, else the count.
                     def get_baseline_count(container, db: str, coll: str):
                         if not container:
                             return None
@@ -754,7 +745,7 @@ def _run(
 
                     mismatches: list[str] = []
                     found = False
-                    # foreach ($Pair in @(@{Coll='loadtest';Got=...}, @{Coll='payload';Got=...}))
+                    # Compare each verified collection count against its baseline.
                     for pair in (
                         {"Coll": "loadtest", "Got": load_test_count},
                         {"Coll": "payload", "Got": payload_count},
@@ -813,7 +804,7 @@ def _run(
                     )
             # endregion
 
-            # region --- Summary --- (original lines 640-648)
+            # region --- Summary ---
             duration = (datetime.now() - start).total_seconds()
 
             config.write_host("\n=== Restore Complete ===", fg=config.GREEN)
@@ -822,16 +813,16 @@ def _run(
             # endregion
 
         finally:
-            # original inner finally (lines 650-652): Stop-Transcript wrapped in try/catch.
+            # Inner finally: detach the log handlers, swallowing any teardown error.
             try:
                 for h in transcript_handlers:
                     transcript_logger.removeHandler(h)
                     h.close()
-            except Exception:  # noqa: BLE001 - faithful to PS catch {}
+            except Exception:  # noqa: BLE001 - swallow teardown errors during cleanup
                 pass
 
     finally:
-        # original outer finally (lines 654-657): release the concurrency lock regardless of outcome.
+        # Outer finally: release the concurrency lock regardless of outcome.
         config.remove_script_lock(lock_path)
 
 

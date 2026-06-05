@@ -1,24 +1,22 @@
 ###############################################################################################################################
-# Direct-REST FlashArray client — replaces py-pure-client.
+# Direct-REST FlashArray client.
 #
-# WHY DIRECT REST (and not the SDK + Fusion `context_names` routing):
-#   FlashArray API tokens are array-local, and this fleet refuses gateway->remote `context_names`
-#   routing for a token identity ("Operation not permitted"). The only path that reaches every
-#   fleet member is to authenticate and call EACH array DIRECTLY. This mirrors the snapshotui
-#   backend's `_authenticate` / `_authenticate_endpoint` / `_make_request_direct` flow:
+# WHY DIRECT REST:
+#   FlashArray API tokens are array-local, and this fleet refuses gateway->remote routing for a
+#   token identity ("Operation not permitted"). The only path that reaches every fleet member is to
+#   authenticate and call EACH array DIRECTLY, using this per-array auth flow:
 #
 #     1. (preferred) username/password -> POST /api/1.16/auth/apitoken  -> that array's api token
 #     2.             POST /api/1.16/auth/session  (establishes the v1 session cookie)
 #     3.             POST /api/{version}/login    (api-token header) -> x-auth-token
 #
 #   Username/password logs in as the directory user (full fleet/array_admin permissions on every
-#   member), exactly like the PowerShell `Connect-Pfa2Array -Credential` flow. A configured
-#   api-token is used as a fallback, but it only authorizes on the array that issued it.
+#   member), which is what enables fleet-wide access. A configured api-token is used as a fallback,
+#   but it only authorizes on the array that issued it.
 #
-# The `Client` exposes the same method names/kwargs the py-pure-client calls used, so call sites
-# barely change. The key difference: `context_names=[<array>]` no longer means "ask the gateway to
-# route" — it means "connect directly to <array>". Each list carries exactly one target array, which
-# is how the existing call sites already use it.
+# The `Client` method names/kwargs match how the call sites invoke it, so they barely change.
+# `context_names=[<array>]` means "connect directly to <array>". Each list carries exactly one
+# target array, which is how the existing call sites already use it.
 ###############################################################################################################################
 
 from __future__ import annotations
@@ -35,11 +33,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------------------------------------------------------------------------------------------------------
 # Response wrappers + attribute-accessible JSON, so existing call sites keep working unchanged:
 #   _fa() tests isinstance(resp, ValidResponse); call sites read item.name / item.member.name / item.os ...
-# REST returns plain JSON whose keys match the SDK model attribute names (same swagger), so a recursive
-# namespace wrapper reproduces the SDK's attribute access exactly.
+# REST returns plain JSON, so a recursive namespace wrapper exposes those keys as attributes for the
+# call sites that read them.
 # ---------------------------------------------------------------------------------------------------------
 class _Obj:
-    """Recursive attribute view over a JSON dict. Missing attributes return None (like the SDK models)."""
+    """Recursive attribute view over a JSON dict. Missing attributes return None."""
 
     __slots__ = ("_d",)
 
@@ -62,14 +60,14 @@ def _wrap(value: Any) -> Any:
 
 
 class ValidResponse:
-    """Mirror of pypureclient.responses.ValidResponse (only the `.items` surface we use)."""
+    """Response wrapper exposing the `.items` surface the call sites use."""
 
     def __init__(self, items: list):
         self.items = items
 
 
 class ErrorResponse:
-    """Mirror of pypureclient.responses.ErrorResponse. `.errors` carries the *unmasked* FA error dicts."""
+    """Error response wrapper. `.errors` carries the *unmasked* FA error dicts."""
 
     def __init__(self, status_code: Optional[int], errors: list):
         self.status_code = status_code
@@ -242,10 +240,7 @@ class Client:
     def _params(self, **kwargs) -> dict:
         return {k: v for k, v in kwargs.items() if v is not None}
 
-    # ---- SDK-shaped methods (only those the codebase uses) -----------------------------------------------
-    def get_fleets(self):
-        return self._request(None, "GET", "fleets")
-
+    # ---- REST methods (only those the codebase uses) -----------------------------------------------------
     def get_fleets_members(self, fleet_names: Optional[list] = None):
         return self._request(None, "GET", "fleets/members",
                              params=self._params(fleet_names=self._csv(fleet_names)))

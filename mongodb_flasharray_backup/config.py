@@ -1,15 +1,12 @@
 ###############################################################################################################################
-# Shared configuration for all mongodb-flasharray-backup scripts (Python port of Config.ps1).
+# Shared configuration for all mongodb-flasharray-backup scripts.
 #
-# In PowerShell every script dot-sources Config.ps1 at its top:
-#   . "$PSScriptRoot/Config.ps1"
-# In Python the equivalent is: `from . import config` then `config.load_config()` at the start of each
-# command's main(). load_config() reads the .env file (throwing if it or a required key is missing),
-# exactly mirroring the side effects of dot-sourcing Config.ps1.
+# Each command calls `from . import config` then `config.load_config()` at the start of its main().
+# load_config() reads the .env file, throwing if it or a required key is missing.
 #
 # All values are loaded from a .env file. Copy .env.example to .env and fill in your values before running
 # any script. The .env is located via $MONGO_FA_BACKUP_ENV, else python-dotenv's search from the CWD, else
-# ./.env (this is the Python analogue of Config.ps1's $PSScriptRoot/.env).
+# ./.env.
 #
 # Cluster topology and FlashArray volume mappings are discovered at runtime from authoritative sources
 # (Ops Manager API and FlashArray SCSI serial numbers). .env values are used only for credentials and as a
@@ -39,19 +36,19 @@ import typer
 from dotenv import find_dotenv
 
 # ---------------------------------------------------------------------------------------------------------
-# Write-Host color map. Translates PowerShell -ForegroundColor names to click/typer color names so the
-# operator-visible coloring is preserved (Cyan/Green/Yellow/DarkYellow/Red/DarkGray).
+# Color map for operator-visible console output, expressed as click/typer color names
+# (Cyan/Green/Yellow/DarkYellow/Red/DarkGray).
 # ---------------------------------------------------------------------------------------------------------
 CYAN = "cyan"
 GREEN = "green"
-YELLOW = "bright_yellow"       # PowerShell "Yellow" renders bright
-DARK_YELLOW = "yellow"         # PowerShell "DarkYellow" renders as plain (olive) yellow
+YELLOW = "bright_yellow"       # "Yellow" renders bright
+DARK_YELLOW = "yellow"         # "DarkYellow" renders as plain (olive) yellow
 RED = "red"
 DARK_GRAY = "bright_black"
 
 
 def write_host(message: str, fg: Optional[str] = None) -> None:
-    """Equivalent of `Write-Host [-ForegroundColor <fg>]`."""
+    """Print a message to the console, optionally colored with the given foreground color."""
     typer.secho(message, fg=fg)
 
 
@@ -59,13 +56,8 @@ def write_host(message: str, fg: Optional[str] = None) -> None:
 
 
 def _read_env_file(env_file: Path) -> dict[str, str]:
-    """Replicates Config.ps1's custom .env parser exactly:
-        Get-Content $EnvFile | Where-Object { $_ -match '^\\s*[^#\\s]' } | ForEach-Object {
-            $Parts = $_ -split '=', 2
-            if ($Parts.Count -eq 2) { $EnvVars[$Parts[0].Trim()] = $Parts[1].Trim() }
-        }
-    i.e. keep lines whose first non-whitespace char is neither '#' nor whitespace, split on the first '='
-    only, and trim both sides. No quote stripping or variable expansion (matching the original).
+    """Parse a .env file: keep lines whose first non-whitespace char is neither '#' nor whitespace, split
+    on the first '=' only, and trim both sides. No quote stripping or variable expansion.
     """
     env_vars: dict[str, str] = {}
     for line in env_file.read_text().splitlines():
@@ -77,7 +69,7 @@ def _read_env_file(env_file: Path) -> dict[str, str]:
 
 
 def get_env_var(env_vars: dict[str, str], key: str, optional: bool = False) -> Optional[str]:
-    """Config.ps1: Get-EnvVar — returns value, or $null if -Optional, else throws."""
+    """Return the value for key, or None if optional, else raise."""
     if key in env_vars:
         return env_vars[key]
     if optional:
@@ -87,7 +79,7 @@ def get_env_var(env_vars: dict[str, str], key: str, optional: bool = False) -> O
 
 @dataclass
 class Config:
-    """Holds every value Config.ps1 derives from .env. Populated by load_config()."""
+    """Holds every value derived from .env. Populated by load_config()."""
 
     EnvVars: dict[str, str]
     # MongoDB cluster topology
@@ -118,8 +110,7 @@ class Config:
     OmPrivateKey: str
 
 
-# Module-level config singleton. Mirrors Config.ps1's script-scope variables being available to all
-# functions after dot-sourcing. None until load_config() runs.
+# Module-level config singleton, available to all functions in this module. None until load_config() runs.
 CFG: Optional[Config] = None
 
 
@@ -136,9 +127,9 @@ def _resolve_env_file(env_path: Optional[os.PathLike | str]) -> Path:
 
 
 def load_config(env_path: Optional[os.PathLike | str] = None) -> Config:
-    """Python equivalent of dot-sourcing Config.ps1: load .env and populate CFG.
+    """Load .env and populate CFG.
 
-    Throws if the .env file is missing or a required key is absent — exactly like Config.ps1.
+    Throws if the .env file is missing or a required key is absent.
     """
     global CFG
     env_file = _resolve_env_file(env_path)
@@ -217,7 +208,7 @@ def load_config(env_path: Optional[os.PathLike | str] = None) -> Config:
 
 def _require_cfg() -> Config:
     if CFG is None:
-        raise RuntimeError("Config not loaded. Call config.load_config() first (Python equivalent of dot-sourcing Config.ps1).")
+        raise RuntimeError("Config not loaded. Call config.load_config() first.")
     return CFG
 
 
@@ -226,8 +217,8 @@ def _require_cfg() -> Config:
 # region --- SSH options ---
 
 # SSH options: never prompt interactively, fail fast on auth/host-key issues, and multiplex concurrent ssh
-# invocations onto a single TCP connection per remote host (ControlMaster). See Config.ps1 for the full
-# rationale (avoiding sshd MaxStartups saturation). These are passed verbatim to the system `ssh`/`scp`.
+# invocations onto a single TCP connection per remote host (ControlMaster), which avoids saturating sshd's
+# MaxStartups limit. These are passed verbatim to the system `ssh`/`scp`.
 SSH_OPTS: list[str] = [
     "-o", "BatchMode=yes",
     "-o", "StrictHostKeyChecking=no",
@@ -243,7 +234,7 @@ SSH_OPTS: list[str] = [
 
 
 def _as_int(value: str) -> Optional[int]:
-    """PowerShell `$x -as [int]` — returns the int or None."""
+    """Returns the int parsed from value, or None if it cannot be parsed."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -251,7 +242,7 @@ def _as_int(value: str) -> Optional[int]:
 
 
 def _process_alive(pid: int) -> bool:
-    """PowerShell `Get-Process -Id $pid -ErrorAction SilentlyContinue` truthiness."""
+    """Returns True if a process with the given pid exists, False otherwise."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -262,7 +253,7 @@ def _process_alive(pid: int) -> bool:
 
 
 def new_script_lock(lock_path: str) -> None:
-    """Config.ps1: New-ScriptLock. Atomically acquires a per-script lock file, writing pid/host/started.
+    """Atomically acquires a per-script lock file, writing pid/host/started.
     Throws if a live process already holds the lock; clears and re-acquires if the PID is dead."""
     p = Path(lock_path)
     if p.exists():
@@ -290,7 +281,7 @@ def new_script_lock(lock_path: str) -> None:
             )
 
     # O_CREAT|O_EXCL is atomic - fails if the file already exists, so two concurrent starts can't both win
-    # the race past the exists() check above (faithful to FileMode.CreateNew).
+    # the race past the exists() check above.
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except OSError as e:
@@ -309,7 +300,7 @@ def new_script_lock(lock_path: str) -> None:
 
 
 def remove_script_lock(lock_path: str) -> None:
-    """Config.ps1: Remove-ScriptLock. Idempotent; safe to call from finally blocks."""
+    """Releases the script lock. Idempotent; safe to call from finally blocks."""
     p = Path(lock_path)
     if p.exists():
         try:
@@ -324,12 +315,9 @@ def invoke_parallel_or_throw(
     step_name: str,
     throttle_limit: int = 10,
 ) -> list[dict]:
-    """Config.ps1: Invoke-ParallelOrThrow. Runs script_block in parallel across input_objects.
+    """Runs script_block in parallel across input_objects.
     Each call must return a dict with at minimum {'Success': bool, 'Message': ...} plus a key field named
-    either 'Key' or 'Node'. Throws if any item failed. Returns the list of result dicts.
-
-    Note: ForEach-Object -Parallel runspaces can't see outer functions; Python threads share globals so that
-    constraint is gone, but call sites preserve the same inline-vs-helper structure for a 1:1 translation."""
+    either 'Key' or 'Node'. Throws if any item failed. Returns the list of result dicts."""
     with ThreadPoolExecutor(max_workers=throttle_limit) as ex:
         results = list(ex.map(script_block, input_objects))
     failures = [r for r in results if not r.get("Success")]
@@ -347,24 +335,23 @@ def invoke_parallel_or_throw(
 
 # region --- HTTP Digest auth for Ops Manager API ---
 
-# Implements the standard two-step Digest challenge/response flow (RFC 2617 / qop=auth) manually, exactly as
-# Config.ps1 does (PowerShell's -Authentication Digest is unsupported on macOS in PS7). Shared by snapshot,
-# restore, tailer and replay.
+# Implements the standard two-step Digest challenge/response flow (RFC 2617 / qop=auth) manually. Shared by
+# snapshot, restore, tailer and replay.
 
 
 def get_md5_hash(plain_text: str) -> str:
-    """Config.ps1: Get-MD5Hash — lowercase hex MD5 of the UTF-8 bytes."""
+    """Returns the lowercase hex MD5 of the UTF-8 bytes of plain_text."""
     return hashlib.md5(plain_text.encode("utf-8")).hexdigest()
 
 
 def _match(text: str, pattern: str) -> str:
-    """[regex]::Match(...).Groups[1].Value — group 1 or '' if no match."""
+    """Returns capture group 1 of pattern in text, or '' if no match."""
     m = re.search(pattern, text)
     return m.group(1) if m else ""
 
 
 def _path_and_query(uri: str) -> str:
-    """([uri]$Uri).PathAndQuery"""
+    """Returns the path and query portion of uri (e.g. '/foo?bar=1')."""
     parts = urlsplit(uri)
     return parts.path + (f"?{parts.query}" if parts.query else "")
 
@@ -375,9 +362,9 @@ def invoke_om_api(
     body: Any = None,
     path_prefix: str = "backup/third_party/",
 ) -> Any:
-    """Config.ps1: Invoke-OmApi. Manual Digest auth against the Ops Manager API.
+    """Manual Digest auth against the Ops Manager API.
 
-    PathPrefix controls what is inserted between the base URL and Path. Default 'backup/third_party/' for the
+    path_prefix controls what is inserted between the base URL and path. Default 'backup/third_party/' for the
     third-party backup API; pass '' to reach the public API root (e.g. /groups/{id}/hosts)."""
     cfg = _require_cfg()
     uri = f"{cfg.OpsManagerBaseUrl}/{path_prefix}{path}"
@@ -454,12 +441,11 @@ def invoke_om_api_with_retry(
     max_attempts: int = 5,
     backoff_sec: int = 5,
 ) -> Any:
-    """Config.ps1: Invoke-OmApiWithRetry. Retries transient errors (network blips, 5xx). Does NOT retry
-    permanent 4xx errors."""
+    """Retries transient errors (network blips, 5xx). Does NOT retry permanent 4xx errors."""
     for attempt in range(1, max_attempts + 1):
         try:
             return invoke_om_api(method=method, path=path, body=body)
-        except Exception as e:  # noqa: BLE001 - faithful to PS catch-all
+        except Exception as e:  # noqa: BLE001 - intentional catch-all for transient-error retry
             msg = str(e)
             # Don't retry on permanent client errors
             if re.search(r"\b(400|401|403|404|409|415|422)\b", msg):
@@ -476,7 +462,7 @@ def invoke_om_api_with_retry(
 
 
 def invoke_mongos(eval_str: str) -> str:
-    """Config.ps1: Invoke-Mongos — runs JavaScript against the mongos router over SSH."""
+    """Runs JavaScript against the mongos router over SSH."""
     cfg = _require_cfg()
     remote = f"{cfg.MongoshPath} --quiet --eval '{eval_str}' mongodb://{cfg.MongosHost}:{cfg.MongosPort} 2>/dev/null"
     proc = subprocess.run(
@@ -490,8 +476,7 @@ def invoke_mongos(eval_str: str) -> str:
 
 
 # Shared mongosh JavaScript snippets. Centralized here so Snapshot, Replay, and Tailer all emit the same
-# shape. In PowerShell $OplogTopJs used "\$natural" so PS would not interpolate $natural; in Python strings
-# do not interpolate $, so the literal $natural is written directly.
+# shape. Python strings do not interpolate $, so the literal $natural is written directly.
 LIST_SHARDS_JS = (
     'var shards=db.adminCommand({listShards:1}).shards; var out=[]; '
     'for(var i=0;i<shards.length;i++){var s=shards[i]; '
@@ -511,8 +496,8 @@ def invoke_mongosh_js(
     max_attempts: int = 1,
     context: str = "mongosh",
 ) -> str:
-    """Config.ps1: Invoke-MongoshJs. Runs a mongosh --eval expression on a remote host via SSH and returns
-    the raw stdout. Throws on non-zero exit (after any requested retries). Caller parses the returned string."""
+    """Runs a mongosh --eval expression on a remote host via SSH and returns the raw stdout. Throws on
+    non-zero exit (after any requested retries). Caller parses the returned string."""
     cfg = _require_cfg()
     last_exit = 0
     raw: Optional[str] = None
@@ -540,8 +525,8 @@ def wait_om_snapshot_state(
     timeout_minutes: int = 150,
     poll_interval_sec: int = 10,
 ) -> None:
-    """Config.ps1: Wait-OmSnapshotState. Polls the third-party backup API until the snapshot reaches
-    target_state, aborting on FAILED/FAILING or after a timeout."""
+    """Polls the third-party backup API until the snapshot reaches target_state, aborting on FAILED/FAILING
+    or after a timeout."""
     cfg = _require_cfg()
     state = ""
     deadline = time.monotonic() + timeout_minutes * 60
@@ -565,20 +550,19 @@ def wait_om_snapshot_state(
 # region --- FlashArray connection + response helpers (direct REST) ---
 
 # The direct-REST client (fa_rest.Client) returns ValidResponse (with .items) or ErrorResponse, and does
-# NOT raise on API errors. _fa() centralizes the unwrap and maps PowerShell's -ErrorAction:
-#   allow_error=False  -> raise on ErrorResponse   (the cmdlet default / -ErrorAction Stop)
-#   allow_error=True   -> return [] on ErrorResponse (-ErrorAction SilentlyContinue)
-# This reproduces the PS pattern where `if ($Pg)` tests truthiness of a possibly-$null result.
+# NOT raise on API errors. _fa() centralizes the unwrap:
+#   allow_error=False  -> raise on ErrorResponse
+#   allow_error=True   -> return [] on ErrorResponse
+# Callers can then test the returned list for truthiness instead of handling errors at each call site.
 
 
 def connect_fa(verify_ssl: bool = False):
     """Connect to the FlashArray fleet via direct REST (fa_rest.Client) and authenticate the gateway.
 
-    Replaces the former py-pure-client SDK. Per-array routing is done by connecting DIRECTLY to each fleet
-    member, because the gateway's `context_names` routing is not permitted for a token identity here. Auth
-    prefers FA_USERNAME+FA_PASSWORD (directory login -> per-array api token, authorized fleet-wide, like the
-    PowerShell `-Credential` flow) and falls back to FA_APITOKEN (array-local). verify_ssl is accepted for
-    signature parity; TLS verification is always disabled (== -IgnoreCertificateError)."""
+    Per-array routing is done by connecting DIRECTLY to each fleet member, because the gateway's
+    `context_names` routing is not permitted for a token identity here. Auth prefers FA_USERNAME+FA_PASSWORD
+    (directory login -> per-array api token, authorized fleet-wide) and falls back to FA_APITOKEN
+    (array-local). verify_ssl is accepted for signature parity; TLS verification is always disabled."""
     cfg = _require_cfg()
     import sys
     from . import fa_rest
@@ -614,7 +598,7 @@ def _fa(resp: Any, allow_error: bool = False) -> list:
 
 
 def get_cluster_nodes() -> list[str]:
-    """Config.ps1: Get-ClusterNodes. Returns the hostnames of all nodes belonging to ClusterId in GroupId.
+    """Returns the hostnames of all nodes belonging to ClusterId in GroupId.
     Queries the OM /hosts API first (authoritative), falling back to CLUSTER_NODES from .env if OM is
     unreachable. Throws if neither source can provide nodes."""
     cfg = _require_cfg()
@@ -638,7 +622,7 @@ def get_cluster_nodes() -> list[str]:
             write_host(f"  Cluster nodes discovered from Ops Manager ({len(nodes)}): {', '.join(nodes)}", fg=CYAN)
             return nodes
         write_host(f"  WARNING: OM returned 0 hosts for clusterId={cfg.ClusterId} - falling back to .env", fg=YELLOW)
-    except Exception as e:  # noqa: BLE001 - faithful to PS catch
+    except Exception as e:  # noqa: BLE001 - intentional catch-all so any OM failure falls back to .env
         write_host(f"  WARNING: OM node discovery failed ({e}) - falling back to .env", fg=YELLOW)
     if not cfg.ClusterNodesFallback:
         raise RuntimeError("Could not discover cluster nodes from Ops Manager and CLUSTER_NODES is not set in .env")
@@ -650,8 +634,8 @@ def get_cluster_nodes() -> list[str]:
 
 
 def resolve_fa_context_names(fa: Any, pg_name: str) -> list[str]:
-    """Config.ps1: Resolve-FaContextNames. Returns the short names of all fleet FlashArrays that have
-    pg_name as a protection group. Filters out FlashBlades. Throws if no arrays have the PG."""
+    """Returns the short names of all fleet FlashArrays that have pg_name as a protection group. Filters
+    out FlashBlades. Throws if no arrays have the PG."""
     # Get all fleet members with minimal retries (fast path)
     fleet_members = None
     for attempt in range(1, 3):
@@ -660,7 +644,7 @@ def resolve_fa_context_names(fa: Any, pg_name: str) -> list[str]:
             break
         except Exception as e:  # noqa: BLE001
             if attempt < 2:
-                write_host(f"  WARNING: Get-Pfa2FleetMember attempt {attempt} failed: {e}. Retrying in 2s...", fg=YELLOW)
+                write_host(f"  WARNING: fleet-member lookup attempt {attempt} failed: {e}. Retrying in 2s...", fg=YELLOW)
                 time.sleep(2)
             else:
                 raise
@@ -697,15 +681,15 @@ def resolve_fa_context_names(fa: Any, pg_name: str) -> list[str]:
             write_host(f"    {array_name}: PG '{pg_name}' NOT found", fg=DARK_GRAY)
     if len(contexts_with_pg) == 0:
         raise RuntimeError(
-            f"No FlashArrays found with protection group '{pg_name}'. Run Initialize-ProtectionGroups.ps1 first."
+            f"No FlashArrays found with protection group '{pg_name}'. Run initialize-protection-groups first."
         )
     write_host(f"  Resolved {len(contexts_with_pg)} FlashArray(s) with PG.", fg=GREEN)
     return contexts_with_pg
 
 
 def get_fa_snapshot_tags(fa: Any, context_names: list[str], snapshot_name: str) -> dict[str, str]:
-    """Config.ps1: Get-FaSnapshotTags. Reads metadata tags from a PG snapshot, trying each array in
-    context_names in order. Returns a dict of tag key -> value from the first array that returns any tag."""
+    """Reads metadata tags from a PG snapshot, trying each array in context_names in order. Returns a dict
+    of tag key -> value from the first array that returns any tag."""
     for ctx_name in context_names:
         tags = _fa(
             fa.get_protection_group_snapshots_tags(context_names=[ctx_name], resource_names=[snapshot_name]),
@@ -724,8 +708,8 @@ def get_fa_snapshot_tags(fa: Any, context_names: list[str], snapshot_name: str) 
     return {}
 
 
-# SCSI serial discovery command, used by Resolve-NodeToArrayVolumeMap. Primary path: findmnt -> lsblk PKNAME
-# -> lsblk SERIAL. Fallback (volume unmounted, e.g. mid-restore): scan all disks for an FA-format serial.
+# SCSI serial discovery command, used by resolve_node_to_array_volume_map. Primary path: findmnt -> lsblk
+# PKNAME -> lsblk SERIAL. Fallback (volume unmounted, e.g. mid-restore): scan all disks for an FA-format serial.
 _SERIAL_CMD = (
     'p=$(findmnt -no SOURCE /data/mongo 2>/dev/null); if [ -n "$p" ]; then '
     'pk=$(lsblk -no PKNAME "$p" 2>/dev/null); lsblk -no SERIAL "/dev/$pk" 2>/dev/null | head -1; '
@@ -740,8 +724,8 @@ def resolve_node_to_array_volume_map(
     ssh_opts_param: list[str],
     context_names: list[str],
 ) -> dict[str, dict[str, str]]:
-    """Config.ps1: Resolve-NodeToArrayVolumeMap. For each node, SSH to read the SCSI serial of the device
-    backing /data/mongo, then query each fleet array to find which one owns a volume with that serial.
+    """For each node, SSH to read the SCSI serial of the device backing /data/mongo, then query each fleet
+    array to find which one owns a volume with that serial.
     Returns node -> {'ShortName': <array>, 'VolumeName': <vol>}. Throws if any node cannot be resolved."""
     node_map: dict[str, dict[str, str]] = {}
     for node in nodes:

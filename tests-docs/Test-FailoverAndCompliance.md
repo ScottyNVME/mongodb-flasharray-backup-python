@@ -23,8 +23,8 @@ mongos() {
 ```
 
 > **Manual Ops Manager API calls** below use the project's own `config.invoke_om_api` helper (the same
-> Digest-auth client every command uses), driven from a short `python3` heredoc. This replaces the
-> PowerShell `Invoke-OmApi` cmdlet and reads `OM_*` settings from `.env` automatically.
+> Digest-auth client every command uses), driven from a short `python3` heredoc; it reads `OM_*`
+> settings from `.env` automatically.
 
 ---
 
@@ -351,12 +351,10 @@ The pre-flight output lists one chosen node per RS from among `aen-mongo-01`,
 Confirms `restore-mongo-snapshot` refuses to touch a single volume unless the target snapshot is
 present and consistent on every relevant array.
 
-> **Implementation note (differs from the PowerShell original):** the PowerShell version validated the
-> restore target by reading a `~/mongo-snapshots/<tag>.json` sidecar and calling `POST /clusters` with
-> its `snapshotMetadata`. The Python port has **no sidecar and no `POST /clusters` step**. Instead, all
-> restore metadata lives in the FlashArray snapshot **tags**, and STEP 0 validates at the storage layer:
-> the snapshot must exist on every context array, every node's member snapshot must exist, and each
-> live volume's size must match its snapshot — otherwise the command aborts before any overwrite.
+> **Implementation note:** all restore metadata lives in the FlashArray snapshot **tags**, and STEP 0
+> validates the target at the storage layer: the snapshot must exist on every context array, every
+> node's member snapshot must exist, and each live volume's size must match its snapshot — otherwise the
+> command aborts before any overwrite.
 
 ### Steps
 

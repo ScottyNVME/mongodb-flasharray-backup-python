@@ -1,9 +1,9 @@
 ###############################################################################################################################
 # Multi-Array MongoDB Snapshot - Pure Storage FlashArray + MongoDB Ops Manager Third-Party Backup API
 #
-# Python port of reference/New-MongoSnapshot.ps1. This is a behavior-preserving 1:1 translation; see the
-# original header for the full scenario/topology/flow narrative. The STEP/region structure of the original is
-# preserved verbatim and each block is annotated with the original block it maps to.
+# Orchestrates a crash-consistent, multi-array MongoDB backup: it validates cluster health, opens the Ops
+# Manager backup cursor, takes FlashArray protection group snapshots across the fleet, captures baselines and
+# oplog anchors, then finishes the snapshot job. The flow is organized into the numbered STEP/region blocks below.
 ###############################################################################################################################
 
 # region --- imports / module setup ---
@@ -28,7 +28,7 @@ from . import config
 # endregion
 
 
-# Maps the PS [ValidatePattern('^om-\d{8}-\d{6}$')] on -SnapshotTag.
+# Validates --snapshot-tag against the required om-YYYYMMDD-HHmmss pattern.
 def _validate_snapshot_tag(value: str) -> str:
     if value:
         if not re.match(r"^om-\d{8}-\d{6}$", value):
@@ -39,7 +39,7 @@ def _validate_snapshot_tag(value: str) -> str:
     return value
 
 
-# Mirrors `Start-Transcript -Path $LogPath -Append`: console StreamHandler + FileHandler to the SAME dir/file.
+# Tees output to a transcript: a console StreamHandler plus an appending FileHandler on the same log file.
 def _start_transcript(log_path: Path) -> logging.Logger:
     logger = logging.getLogger("mongo-snapshot")
     logger.setLevel(logging.INFO)
@@ -66,22 +66,22 @@ def _stop_transcript(logger: Optional[logging.Logger]) -> None:
         logger.removeHandler(h)
 
 
-# region --- worker (param block: New-MongoSnapshot.ps1 param(...)) ---
+# region --- worker (param block) ---
 def _run(
-    # -BaselineDatabase (default 'testdb'): db whose collection counts to record as a baseline.
+    # --baseline-database (default 'testdb'): db whose collection counts to record as a baseline.
     baseline_database: str = typer.Option(
         "testdb",
         "--baseline-database",
         help="Database whose collection counts to record as a baseline for restore-side verification. "
         "Set to '' to skip baseline capture entirely.",
     ),
-    # -BaselineCollections (default @('loadtest', 'payload')): collections within $BaselineDatabase to count.
+    # --baseline-collections (default ['loadtest', 'payload']): collections within --baseline-database to count.
     baseline_collections: list[str] = typer.Option(
         ["loadtest", "payload"],
         "--baseline-collections",
         help="Collections within --baseline-database to count.",
     ),
-    # -SnapshotTag (default ''): optional override of the auto-generated snapshot tag (om-YYYYMMDD-HHmmss).
+    # --snapshot-tag (default ''): optional override of the auto-generated snapshot tag (om-YYYYMMDD-HHmmss).
     snapshot_tag: str = typer.Option(
         "",
         "--snapshot-tag",
@@ -89,12 +89,9 @@ def _run(
         help="Optional: override the auto-generated snapshot tag (om-YYYYMMDD-HHmmss).",
     ),
 ) -> None:
-    # Python equivalent of dot-sourcing Config.ps1: load .env (throws if missing) FIRST.
+    # Load .env FIRST (raises if missing) so all configuration is available before any work begins.
     config.load_config()
     cfg = config.CFG
-
-    # Import-Module PureStoragePowerShellSDK2 -> replaced by the direct-REST client (config.connect_fa / fa_rest.py).
-    # $ErrorActionPreference = 'Stop' -> Python exceptions propagate by default; no equivalent statement.
 
     # region --- Configuration ---
     TimeoutMinutes = 150     # Max time for PENDING -> FINISHED
@@ -104,11 +101,11 @@ def _run(
     # region --- STEP 0: Pre-flight ---
     config.write_host("\n=== STEP 0: Pre-flight ===", fg=config.YELLOW)
 
-    # Concurrency lock with stale-PID detection (New-ScriptLock in Config.ps1).
+    # Concurrency lock with stale-PID detection.
     LockPath = str(Path.home() / ".mongo-snapshot.lock")
     config.new_script_lock(LockPath)
 
-    # State carried across the nested try/finally blocks (PS $Start / $FaSnapshots / $SnapshotId etc.).
+    # State carried across the nested try/finally blocks (Start, FaSnapshots, SnapshotId, etc.).
     Start = datetime.now()
     SnapshotId = None
     FaSnapshots: list = []
@@ -210,7 +207,7 @@ def _run(
             if not Member:
                 raise RuntimeError(
                     f"Volume '{VolumeName}' (node {Node}, array {ShortName}) is NOT a member of PG "
-                    f"'{cfg.ProtectionGroupName}'. Run Initialize-ProtectionGroups.ps1 to add it before "
+                    f"'{cfg.ProtectionGroupName}'. Run initialize-protection-groups to add it before "
                     "taking snapshots."
                 )
             config.write_host(f"    PG member verified: {VolumeName} on {ShortName}", fg=config.CYAN)
@@ -222,7 +219,7 @@ def _run(
             "\n=== STEP 1: Selecting snapshotable nodes (one secondary per shard) ===", fg=config.YELLOW
         )
 
-        # $ClusterDetail was already fetched in STEP 0 pre-flight.
+        # ClusterDetail was already fetched in STEP 0 pre-flight.
         NodeIds: list[str] = []
 
         for RS in replica_sets:
@@ -266,9 +263,7 @@ def _run(
         LogPath = LogDir / f"snapshot-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
         transcript_logger = _start_transcript(LogPath)
 
-        # $Start was set above (before the lock try) to match $Start = Get-Date placement; the original sets
-        # $Start here. Reset it here to faithfully match the original ordering.
-        # [CLARIFICATION NEEDED: original sets $Start AFTER Start-Transcript; we set it here to match.]
+        # Reset the duration timer here, after the transcript is open, so it measures the actual snapshot work.
         Start = datetime.now()
 
         CreateResponse = config.invoke_om_api(
@@ -309,10 +304,9 @@ def _run(
                 "\n=== STEP 5: Taking FlashArray protection group snapshots ===", fg=config.YELLOW
             )
 
-            # $SnapshotTag = if ($SnapshotTag) { $SnapshotTag } else { "om-" + (Get-Date ...) }
+            # Use the provided tag if set, otherwise auto-generate one as om-YYYYMMDD-HHmmss.
             SnapshotTag = snapshot_tag if snapshot_tag else ("om-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
 
-            # function Get-CollectionCounts ([string]$Label)
             def get_collection_counts(label: str):
                 if not baseline_database or not baseline_collections or len(baseline_collections) == 0:
                     return None
@@ -321,7 +315,7 @@ def _run(
                     f"{cfg.MongosHost}:{cfg.MongosPort} ...",
                     fg=config.CYAN,
                 )
-                # Retry transient SSH/mongosh failures (handled inside invoke_mongosh_js MaxAttempts=5).
+                # Retry transient SSH/mongosh failures (handled inside invoke_mongosh_js, max_attempts=5).
                 try:
                     DbCounts: dict[str, int] = {}
                     for Coll in baseline_collections:
@@ -342,14 +336,13 @@ def _run(
                             f"    {label}  {baseline_database}.{Coll} = {DbCounts[Coll]}", fg=config.GREEN
                         )
                     return {baseline_database: DbCounts}
-                except Exception as e:  # noqa: BLE001 - faithful to PS catch
+                except Exception as e:  # noqa: BLE001
                     config.write_host(
                         f"  WARNING: {label} baseline capture failed - tag will omit {label}. ({e})",
                         fg=config.YELLOW,
                     )
                     return None
 
-            # function Get-ShardOplogAnchors
             def get_shard_oplog_anchors():
                 config.write_host(
                     "  Capturing per-shard oplog anchors (post-FA-snap, cursor still open)...",
@@ -411,7 +404,7 @@ def _run(
                             fg=config.GREEN,
                         )
                     return Anchors
-                except Exception as e:  # noqa: BLE001 - faithful to PS catch
+                except Exception as e:  # noqa: BLE001
                     config.write_host(
                         f"  WARNING: oplog anchor capture failed - PITR tailer will not have a "
                         f"snapshot-aligned start point. ({e})",
@@ -464,7 +457,7 @@ def _run(
                         )
                         snap_items = config._fa(snap_resp)
                         Snap = snap_items[0] if snap_items else None
-                    except Exception as e:  # noqa: BLE001 - faithful to PS catch
+                    except Exception as e:  # noqa: BLE001
                         msg = str(e)
                         if re.search("Name already in use", msg):
                             # A prior attempt timed out but the FA still created the snapshot.
@@ -570,7 +563,7 @@ def _run(
                                 fg=config.GREEN,
                             )
                             TagsOk = True
-                        except Exception as e:  # noqa: BLE001 - faithful to PS catch
+                        except Exception as e:  # noqa: BLE001
                             if attempt < 3:
                                 config.write_host(
                                     f"  WARNING: Tag update attempt {attempt} on {CtxName}: {e}. "
@@ -593,7 +586,7 @@ def _run(
             # endregion
 
         except Exception:
-            # PS: catch { Write-Host "`n  ERROR: $_" -Red; throw }
+            # Log the error and re-raise so the finally block can release the backup cursor.
             import sys
 
             config.write_host(f"\n  ERROR: {sys.exc_info()[1]}", fg=config.RED)
