@@ -9,7 +9,6 @@ description = "Crash-consistent snapshot backup + PITR of a MongoDB 8.0 sharded 
 requires-python = ">=3.11"
 dependencies = [
     "python-dotenv>=1.0",
-    "py-pure-client>=1.62",
     "requests>=2.31",
     "typer>=0.12",
 ]

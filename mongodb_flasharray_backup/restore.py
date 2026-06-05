@@ -57,7 +57,7 @@ import typer
 from . import config
 
 # Import models for FlashArray (py-pure-client). Mirrors `Import-Module PureStoragePowerShellSDK2` (line 65).
-from pypureclient import flasharray
+# FlashArray access is via the direct-REST client (config.connect_fa / fa_rest.py).
 
 
 app = typer.Typer(add_completion=False)
@@ -470,9 +470,7 @@ def _run(
                         config._fa(
                             fa.post_volumes(
                                 names=[volume_name],
-                                volume=flasharray.VolumePost(
-                                    source=flasharray.Reference(name=snap_name)
-                                ),
+                                volume={"source": {"name": snap_name}},
                                 overwrite=True,
                                 context_names=[short_name],
                             ),

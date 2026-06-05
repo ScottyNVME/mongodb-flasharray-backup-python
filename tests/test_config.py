@@ -40,7 +40,7 @@ def _write_full_env(p: Path):
         "MONGO_TOOLS_BASE=/opt/mongo-tools\n"
         "FA_ENDPOINT=10.0.0.1\n"
         "FA_USERNAME=pureuser\n"
-        "FA_PASSWORD=secret=with=equals\n"  # value contains '=' -> split on first only
+        "FA_APITOKEN=secret=with=equals\n"  # value contains '=' -> split on first only
         "FA_PROTECTION_GROUP=mongo-pg\n"
         "FA_CLUSTER_NAME=aen\n"
         "OM_BASE_URL=http://om.example.com:8080/\n"  # trailing slash trimmed
@@ -61,7 +61,7 @@ def test_load_config_full(tmp_path):
     assert cfg.MongodumpPath == "/opt/mongo-tools/mongodump"
     assert cfg.MongorestorePath == "/opt/mongo-tools/mongorestore"
     # value with '=' preserved after first split (split('=', 1))
-    assert cfg.FaPassword == "secret=with=equals"
+    assert cfg.FaApiToken == "secret=with=equals"
     # OM base URL trailing slash trimmed + version appended
     assert cfg.OpsManagerBaseUrl == "http://om.example.com:8080/api/public/v1.0"
     # CLUSTER_NODES optional + absent -> None fallback

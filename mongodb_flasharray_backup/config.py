@@ -103,7 +103,9 @@ class Config:
     # Pure Storage FlashArray
     FaEndpoint: str
     FaUsername: str
-    FaPassword: str
+    FaApiToken: Optional[str]
+    FaPassword: Optional[str]
+    FaApiVersion: str
     ProtectionGroupName: str
     ClusterName: str
     # Ops Manager
@@ -165,8 +167,14 @@ def load_config(env_path: Optional[os.PathLike | str] = None) -> Config:
 
     # --- Pure Storage FlashArray ---
     fa_endpoint = g("FA_ENDPOINT")
-    fa_password = g("FA_PASSWORD")
     fa_username = g("FA_USERNAME")
+    # Authenticate with EITHER FA_APITOKEN (array-local) OR FA_USERNAME+FA_PASSWORD (directory login,
+    # which authorizes on every fleet member). Both are optional individually; at least one auth method
+    # must be present or connect_fa() fails.
+    fa_api_token = g("FA_APITOKEN", optional=True)
+    fa_password = g("FA_PASSWORD", optional=True)
+    # FA REST API version to pin (skips version auto-negotiation).
+    fa_api_version = g("FA_API_VERSION", optional=True) or "2.51"
     protection_group_name = g("FA_PROTECTION_GROUP")
     cluster_name = g("FA_CLUSTER_NAME")
 
@@ -191,7 +199,9 @@ def load_config(env_path: Optional[os.PathLike | str] = None) -> Config:
         MongorestorePath=mongorestore_path,
         FaEndpoint=fa_endpoint,
         FaUsername=fa_username,
+        FaApiToken=fa_api_token,
         FaPassword=fa_password,
+        FaApiVersion=fa_api_version,
         ProtectionGroupName=protection_group_name,
         ClusterName=cluster_name,
         OmHost=om_host,
@@ -552,40 +562,45 @@ def wait_om_snapshot_state(
 
 # endregion
 
-# region --- FlashArray connection + response helpers (py-pure-client adaptation) ---
+# region --- FlashArray connection + response helpers (direct REST) ---
 
-# py-pure-client returns ValidResponse (with an .items generator) or ErrorResponse, and does NOT raise on
-# API errors by default. _fa() centralizes the unwrap and maps PowerShell's -ErrorAction:
+# The direct-REST client (fa_rest.Client) returns ValidResponse (with .items) or ErrorResponse, and does
+# NOT raise on API errors. _fa() centralizes the unwrap and maps PowerShell's -ErrorAction:
 #   allow_error=False  -> raise on ErrorResponse   (the cmdlet default / -ErrorAction Stop)
 #   allow_error=True   -> return [] on ErrorResponse (-ErrorAction SilentlyContinue)
 # This reproduces the PS pattern where `if ($Pg)` tests truthiness of a possibly-$null result.
 
 
 def connect_fa(verify_ssl: bool = False):
-    """Shared `Connect-Pfa2Array -EndPoint $FaEndpoint -Credential $FaCred -IgnoreCertificateError`.
+    """Connect to the FlashArray fleet via direct REST (fa_rest.Client) and authenticate the gateway.
 
-    Returns a py-pure-client FlashArray client bound to the gateway. All per-array routing is done by passing
-    context_names=[name] to individual calls (Fusion fleet routing).
-
-    Library-imposed auth mapping: the PowerShell SDK2 accepted a username/password PSCredential, but the
-    py-pure-client FlashArray Client (REST 2.x) authenticates with an API token (or OAuth), not a raw
-    password. We therefore authenticate with FA_PASSWORD treated as the FlashArray API token (see
-    .env.example). FA_USERNAME is retained in .env for parity/reference. verify_ssl=False == -IgnoreCertificateError."""
+    Replaces the former py-pure-client SDK. Per-array routing is done by connecting DIRECTLY to each fleet
+    member, because the gateway's `context_names` routing is not permitted for a token identity here. Auth
+    prefers FA_USERNAME+FA_PASSWORD (directory login -> per-array api token, authorized fleet-wide, like the
+    PowerShell `-Credential` flow) and falls back to FA_APITOKEN (array-local). verify_ssl is accepted for
+    signature parity; TLS verification is always disabled (== -IgnoreCertificateError)."""
     cfg = _require_cfg()
-    from pypureclient import flasharray
+    import sys
+    from . import fa_rest
 
-    return flasharray.Client(
-        target=cfg.FaEndpoint,
-        api_token=cfg.FaPassword,
-        verify_ssl=verify_ssl,
-    )
+    try:
+        return fa_rest.Client(
+            gateway=cfg.FaEndpoint,
+            version=cfg.FaApiVersion,
+            api_token=cfg.FaApiToken,
+            username=cfg.FaUsername,
+            password=cfg.FaPassword,
+        ).connect()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Authentication failed: {exc}")
+        sys.exit(1)
 
 
 def _fa(resp: Any, allow_error: bool = False) -> list:
-    """Unwrap a py-pure-client response to a list of items (see region note)."""
-    from pypureclient.responses import ValidResponse
+    """Unwrap a fa_rest response to a list of items (see region note)."""
+    from . import fa_rest
 
-    if isinstance(resp, ValidResponse):
+    if isinstance(resp, fa_rest.ValidResponse):
         return list(resp.items)
     if allow_error:
         return []
@@ -652,10 +667,19 @@ def resolve_fa_context_names(fa: Any, pg_name: str) -> list[str]:
     all_member_names = [m.member.name for m in fleet_members]
     write_host(f"  Fleet members discovered ({len(all_member_names)}): {', '.join(all_member_names)}", fg=CYAN)
 
-    # Filter out FlashBlades by attempting Get-Pfa2Array (FlashBlades throw "Cross-product" error)
+    # Classify each member as FlashArray vs. other (FlashBlade, etc.) by probing get_arrays directly.
+    # A transient network/auth blip returns the same empty result as a genuine non-FlashArray, so retry
+    # the probe (same 2-attempt treatment as the fleet-member call above) before concluding "not a
+    # FlashArray" — otherwise a momentary hiccup could silently drop a real FlashArray from the backup set.
     flasharray_names: list[str] = []
     for member_name in all_member_names:
-        array_info = _fa(fa.get_arrays(context_names=[member_name]), allow_error=True)
+        array_info: list = []
+        for attempt in range(1, 3):
+            array_info = _fa(fa.get_arrays(context_names=[member_name]), allow_error=True)
+            if array_info:
+                break
+            if attempt < 2:
+                time.sleep(2)
         if array_info and array_info[0].os == "Purity//FA":
             flasharray_names.append(member_name)
         else:
@@ -760,9 +784,13 @@ def resolve_node_to_array_volume_map(
                 found = True
                 break
         if not found:
+            searched = ", ".join(context_names)
             raise RuntimeError(
-                f"No FlashArray volume with serial '{serial}' found across any fleet array for node {node}. "
-                "Verify the pRDM is presented from the expected array."
+                f"No FlashArray volume with serial '{serial}' found for node {node} on any of the "
+                f"{len(context_names)} array(s) searched ({searched}). If this volume lives on a fleet "
+                "array not listed here, that array is not a current backup target (it has no protection "
+                "group) — run Initialize-ProtectionGroups to add it. Otherwise verify the pRDM is "
+                "presented from the expected array."
             )
     return node_map
 

@@ -53,8 +53,7 @@ def _run(
     # PS line 9: . "$PSScriptRoot/Config.ps1" -> load config FIRST (throws like the original without .env).
     config.load_config()
 
-    # PS line 25: Import-Module PureStoragePowerShellSDK2 -ErrorAction Stop
-    from pypureclient import flasharray  # noqa: F401
+    # PS line 25: Import-Module PureStoragePowerShellSDK2 -> replaced by direct-REST (fa_rest.py).
 
     # PS line 27: $ErrorActionPreference = 'Stop'  (Python raises by default; no-op marker).
 

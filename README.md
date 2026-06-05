@@ -49,7 +49,7 @@ console-scripts listed below.
 
 ```bash
 cp .env.example .env
-# Edit .env — fill in FA_ENDPOINT, FA_USERNAME, FA_PASSWORD, OM_BASE_URL, OM_API_VERSION,
+# Edit .env — fill in FA_ENDPOINT, FA_USERNAME, FA_APITOKEN, FA_API_VERSION, OM_BASE_URL, OM_API_VERSION,
 # OM_GROUP_ID, OM_CLUSTER_ID, OM_PUBLIC_KEY, OM_PRIVATE_KEY, MONGOSH_PATH, MONGOS_HOST,
 # MONGOS_PORT, SSH_USER, MONGO_TOOLS_BASE, FA_PROTECTION_GROUP, FA_CLUSTER_NAME,
 # CLUSTER_NODES (comma-separated fallback used only when Ops Manager is unreachable)

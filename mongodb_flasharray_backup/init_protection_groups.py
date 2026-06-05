@@ -17,8 +17,7 @@
 #   init-protection-groups --prune --what-if   # dry run with prune preview
 #   init-protection-groups --prune --force     # skip the typed confirmation (use only in automation)
 
-# Maps original line 30: Import-Module PureStoragePowerShellSDK2 (py-pure-client models).
-from pypureclient import flasharray  # noqa: F401  (imported for parity / model use in prune removal)
+# Maps original line 30: Import-Module PureStoragePowerShellSDK2 -> replaced by direct-REST (fa_rest.py).
 
 import typer
 

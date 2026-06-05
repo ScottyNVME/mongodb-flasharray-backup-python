@@ -23,8 +23,7 @@ import typer
 
 from . import config
 
-# Always import models for FlashArray (py-pure-client) calls.
-from pypureclient import flasharray
+# FlashArray access is via the direct-REST client in config.connect_fa() (see fa_rest.py).
 
 # endregion
 
@@ -94,7 +93,7 @@ def _run(
     config.load_config()
     cfg = config.CFG
 
-    # Import-Module PureStoragePowerShellSDK2 -> handled by `from pypureclient import flasharray` above.
+    # Import-Module PureStoragePowerShellSDK2 -> replaced by the direct-REST client (config.connect_fa / fa_rest.py).
     # $ErrorActionPreference = 'Stop' -> Python exceptions propagate by default; no equivalent statement.
 
     # region --- Configuration ---
@@ -455,13 +454,13 @@ def _run(
                         snap_resp = FA.post_protection_group_snapshots(
                             context_names=[CtxName],
                             source_names=[cfg.ProtectionGroupName],
-                            protection_group_snapshot=flasharray.ProtectionGroupSnapshotPost(
-                                suffix=SnapshotTag,
-                                tags=[
-                                    flasharray.Tag(key=k, value=v, copyable=c)
+                            protection_group_snapshot={
+                                "suffix": SnapshotTag,
+                                "tags": [
+                                    {"key": k, "value": v, "copyable": c}
                                     for k, v, c in zip(tag_keys, tag_values, tag_copyable)
                                 ],
-                            ),
+                            },
                         )
                         snap_items = config._fa(snap_resp)
                         Snap = snap_items[0] if snap_items else None
@@ -549,66 +548,43 @@ def _run(
                 SnapName = f"{cfg.ProtectionGroupName}.{SnapshotTag}"
                 CopyableArr = [True for _ in TagKeys]
 
-                # WORKAROUND: Set-Pfa2ProtectionGroupSnapshotTagBatch returns HTTP 500 when -ContextName
-                # targets a remote fleet array on an existing PG snapshot. Connect directly to each array
-                # and write without -ContextName.
-                GatewayDomain = (
-                    cfg.FaEndpoint[cfg.FaEndpoint.index(".") :] if "." in cfg.FaEndpoint else ""
-                )
-                GatewayShort = cfg.FaEndpoint.split(".")[0]
-
+                # fa_rest connects DIRECTLY to each fleet member, so writing the tag batch is just a
+                # per-array call routed by context_names — no separate gateway-vs-remote session handling.
                 for CtxName in FaContextNames:
-                    # Reuse the already-open gateway session; open a new direct session for other arrays.
-                    IsGateway = CtxName == GatewayShort
-                    ArrayFA = FA if IsGateway else None
-                    ArrayEP = cfg.FaEndpoint if IsGateway else f"{CtxName}{GatewayDomain}"
                     TagsOk = False
-                    try:
-                        if not IsGateway:
-                            # Connect-Pfa2Array -EndPoint $ArrayEP -Credential $FaCred -IgnoreCertificateError
-                            ArrayFA = flasharray.Client(
-                                target=ArrayEP,
-                                username=cfg.FaUsername,
-                                password=cfg.FaPassword,
-                                verify_ssl=False,
+                    attempt = 1
+                    while attempt <= 3 and not TagsOk:
+                        try:
+                            config._fa(
+                                FA.put_protection_group_snapshots_tags_batch(
+                                    context_names=[CtxName],
+                                    resource_names=[SnapName],
+                                    tag=[
+                                        {"key": k, "value": v, "copyable": c}
+                                        for k, v, c in zip(TagKeys, TagValues, CopyableArr)
+                                    ],
+                                )
                             )
-                        attempt = 1
-                        while attempt <= 3 and not TagsOk:
-                            try:
-                                config._fa(
-                                    ArrayFA.put_protection_group_snapshots_tags_batch(
-                                        resource_names=[SnapName],
-                                        tag=[
-                                            flasharray.Tag(key=k, value=v, copyable=c)
-                                            for k, v, c in zip(TagKeys, TagValues, CopyableArr)
-                                        ],
-                                    )
-                                )
+                            config.write_host(
+                                f"  Post-snapshot tags written to {CtxName}.",
+                                fg=config.GREEN,
+                            )
+                            TagsOk = True
+                        except Exception as e:  # noqa: BLE001 - faithful to PS catch
+                            if attempt < 3:
                                 config.write_host(
-                                    f"  Post-snapshot tags written to {CtxName} ({ArrayEP}).",
-                                    fg=config.GREEN,
+                                    f"  WARNING: Tag update attempt {attempt} on {CtxName}: {e}. "
+                                    "Retrying in 5s...",
+                                    fg=config.YELLOW,
                                 )
-                                TagsOk = True
-                            except Exception as e:  # noqa: BLE001 - faithful to PS catch
-                                if attempt < 3:
-                                    config.write_host(
-                                        f"  WARNING: Tag update attempt {attempt} on {CtxName}: {e}. "
-                                        "Retrying in 5s...",
-                                        fg=config.YELLOW,
-                                    )
-                                    time.sleep(5)
-                                else:
-                                    config.write_host(
-                                        f"  WARNING: Failed to update post-snapshot tags on {CtxName} "
-                                        f"after 3 attempts: {e}",
-                                        fg=config.YELLOW,
-                                    )
-                            attempt += 1
-                    except Exception as e:  # noqa: BLE001 - faithful to PS catch (connect failure)
-                        config.write_host(
-                            f"  WARNING: Could not connect to {ArrayEP} to write tags: {e}",
-                            fg=config.YELLOW,
-                        )
+                                time.sleep(5)
+                            else:
+                                config.write_host(
+                                    f"  WARNING: Failed to update post-snapshot tags on {CtxName} "
+                                    f"after 3 attempts: {e}",
+                                    fg=config.YELLOW,
+                                )
+                        attempt += 1
             else:
                 config.write_host(
                     "  No post-snapshot tags to write (postSnap baseline and t1ts both absent).",

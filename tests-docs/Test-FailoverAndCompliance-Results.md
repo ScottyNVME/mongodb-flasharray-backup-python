@@ -18,7 +18,7 @@ OM version: 8.0.23 | MongoDB: 8.0.21-ent
    sudo systemctl stop mongodb-mms-automation-agent
    ```
 3. Waited 35 seconds for OM to detect the failure.
-4. Ran `New-MongoSnapshot.ps1` — observed the full output.
+4. Ran `new-mongo-snapshot` — observed the full output.
 5. Restarted the agent on `aen-mongo-02` and confirmed cluster stability.
 6. Queried the OM API for the snapshot job to confirm OM recorded the failure.
 
@@ -30,7 +30,7 @@ OM version: 8.0.23 | MongoDB: 8.0.21-ent
 | STEP 1 node selection | Selected `aen-mongo-02:27020` for `aen-shard_0` (OM hadn't yet flipped `snapshotable=false`) |
 | STEP 3–4 | Job `6a086df557c4d953749d2ccb` created, `/start` called, job stuck `PENDING` |
 | OM failure detection | OM transitioned job to `FAILED` (agent not responding to cursor-open request) |
-| `Wait-OmSnapshotState` | Detected `FAILED` state, threw exception |
+| `wait_om_snapshot_state` | Detected `FAILED` state, threw exception |
 | `finally` block | `/fail` called → `Backup cursor released` printed → script exited with error |
 | FA snapshot | **Never fired** — job never reached `READY` |
 
@@ -75,9 +75,9 @@ All 3 members returned to correct SECONDARY/PRIMARY roles on all 3 shards. Verif
    ```
    sudo systemctl stop mongodb-mms-automation-agent
    ```
-3. Immediately (without waiting for OM to detect the failure) ran `pitr/Start-OplogTailer.ps1`:
+3. Immediately (without waiting for OM to detect the failure) ran `start-oplog-tailer`:
    ```
-   start-oplog-tailer -SnapshotTag "om-20260516-090000"
+   start-oplog-tailer --snapshot-tag "om-20260516-090000"
    ```
 4. Observed tailer pre-flight and loop behavior until the script exited.
 5. Queried the OM API for the oplog snapshot job to confirm its final state.
@@ -134,7 +134,7 @@ Job remained `PENDING` throughout the test and after script exit. OM never trans
 
 ### Recommended improvement
 
-Add an agent-reachability pre-flight check in `Start-OplogTailer.ps1` before setting `preferredOplogNodes`. If any preferred node's agent is not responding (queryable via `GET group/{id}/agents/MONITORING` or direct TCP probe), skip that node and select the next available secondary. This would prevent dispatching oplog jobs to unreachable agents and avoid the 30-minute coverage gap.
+Add an agent-reachability pre-flight check in `start-oplog-tailer` before setting `preferredOplogNodes`. If any preferred node's agent is not responding (queryable via `GET group/{id}/agents/MONITORING` or direct TCP probe), skip that node and select the next available secondary. This would prevent dispatching oplog jobs to unreachable agents and avoid the 30-minute coverage gap.
 
 ### Cluster state after test
 
