@@ -253,3 +253,28 @@ python3 -c "import datetime as d; print(int(d.datetime.fromisoformat('2026-05-06
 | Replay wall time | <1 second (no post-T1 segments to apply) |
 
 `testdb.loadtest` post-replay (51,800) is within the valid window `[preSnap=51,200, T2=93,400]` — PITR range assertion passed. No post-T1 oplog segments were available for replay because the OM oplog snapshot stream lagged the cluster by ~12.8 hours at T1 snapshot time (last captured segment end: `2026-05-17T01:07:00Z`; T1 snapshot timestamp: `2026-05-17T13:54:23Z`). The cluster remained at the T1 restore baseline, which is a valid PITR outcome: `preSnap ≤ postReplay ≤ T2`.
+
+---
+
+## Verified Results (2026-06-05 — hybrid gateway-routed client, Tests 1–3)
+
+Run via `run-all-tests` (all three phases) against `aen-cluster` with the **hybrid** client
+(`FA_ENDPOINT=sn1-x90r2-f06-27`): object/read operations routed through the Fusion gateway via
+`context_names`, tag operations direct per array. The suite drove 3 snapshots + 3 restores and exited `0`.
+
+| Test | Result | Tag | Detail |
+|---|---|---|---|
+| 1 — basic restore (no load) | ✅ PASS | `om-20260605-183119` | exact recovery — `loadtest` 2,159,780 / `payload` 200,000, **drift 0** |
+| 2 — restore under load | ✅ PASS | `om-20260605-183942` | post-restore `loadtest` 2,330,780 ∈ `[preSnap 2,330,180, postSnap 2,331,180]` (**drift 1000**); ~31k post-snapshot writes correctly lost (pre-drop was 2,361,980). Crash-consistency under ~334 docs/s confirmed. |
+| 3 — PITR under load | ⚠️ PASS (assertion only) | `om-20260605-185104` | T1 baseline restored correctly (`loadtest` 2,459,580 ∈ `[2,459,180, 2,459,980]`); range check passed (∈ `[preSnap, T2=2,511,180]`, `unrecoveredTail=51,600`) — **but oplog replay was a no-op; see note.** |
+
+**Test 3 — PITR caveat (OM oplog-stream backlog, not a code issue).** The tailer captured only stale segments —
+oplog from **2026-05-17 01:07–13:53 UTC** — while T1 was **2026-06-05 23:55 UTC**, a **~19-day** gap, so
+`invoke-oplog-replay` correctly filtered every segment as pre-T1 and the cluster stayed at the T1 restore state.
+Root cause: OM's oplog-snapshot stream cursor for this cluster is frozen at `2026-05-17T13:53` (where the prior
+run left it ~19 days earlier); a fresh tailer resumes from that cursor and replays the backlog oldest-first, so a
+short test window only partially drained `aen-shard_2` (766 files) and never reached `config`/`aen-shard_1`. The
+OM agent **is** producing current segments (on-disk date dirs `2026-05-17`, `2026-06-05`, `2026-06-06`, newest only
+~seconds behind the live oplog head), so the data exists — the stream cursor just hasn't advanced. A true
+forward-PITR demonstration requires advancing/resetting the OM oplog-snapshot stream cursor to ~current (OM-side),
+or running the tailer continuously long enough to drain the backlog, before taking T1.

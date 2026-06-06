@@ -9,3 +9,4 @@ dist/
 swagger.json
 .claude/
 .DS_Store
+mongodb_flasharray_backup/testing/run-alltests-logs/*
