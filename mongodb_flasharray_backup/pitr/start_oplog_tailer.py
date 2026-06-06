@@ -159,10 +159,42 @@ def _run(
         cluster_detail = config.invoke_om_api(
             path=f"group/{group_id}/clusters/{cluster_id}"
         )
+
+        # Agent-reachability pre-check: OM's `snapshotable` flag lags a stopped automation agent by ~35s,
+        # and OM does NOT auto-fail an oplog snapshot job dispatched to a dead agent — the job sits PENDING
+        # (and /fail is a no-op on it), leaving an unrecoverable coverage gap. So before choosing a node as
+        # the preferred oplog node, confirm its automation agent is actually running on its host (SSH
+        # `systemctl is-active`, the inverse of how the agent is stopped). Result is cached per host.
+        _agent_state: dict[str, str] = {}
+
+        def _agent_active(node: dict) -> bool:
+            host = (node.get("id") or "").split(":")[0]
+            if host not in _agent_state:
+                proc = subprocess.run(
+                    ["ssh", *config.SSH_OPTS, f"{config.CFG.SshUser}@{host}",
+                     "systemctl is-active mongodb-mms-automation-agent"],
+                    capture_output=True,
+                    text=True,
+                )
+                # is-active prints active/inactive/failed/...; an SSH failure yields no stdout.
+                _agent_state[host] = (proc.stdout or "").strip() or "unreachable"
+            st = _agent_state[host]
+            if st != "active":
+                config.write_host(
+                    f"    skipping {node.get('id')}: automation agent is '{st}' "
+                    f"(lastAgentPing={node.get('lastAgentPing')})",
+                    fg=config.YELLOW,
+                )
+            return st == "active"
+
         tailing_node_ids: list[str] = []
         for rs in (cluster_detail.get("replicaSets") or []):
+            # Snapshotable candidates whose automation agent is confirmed running.
+            candidates = [
+                n for n in (rs.get("nodes") or [])
+                if n.get("snapshotable") is True and _agent_active(n)
+            ]
             # Priority: hidden secondary > secondary > primary
-            candidates = [n for n in (rs.get("nodes") or []) if n.get("snapshotable") is True]
             chosen = next(
                 (n for n in candidates
                  if n.get("memberState") == "SECONDARY" and n.get("hidden") is True),
@@ -174,14 +206,17 @@ def _run(
                     None,
                 )
             if not chosen:
-                chosen = candidates[0] if candidates else None  # fall back to primary
+                chosen = candidates[0] if candidates else None  # agent-reachable primary fallback
             if not chosen:
                 raise RuntimeError(
-                    f"No snapshotable node found for replica set {rs.get('id')} to use as oplog tailing node."
+                    f"No snapshotable node with a reachable automation agent for replica set "
+                    f"{rs.get('id')}. Refusing to set a preferred oplog node on a host whose agent is down "
+                    "— it would leave the oplog snapshot job stuck PENDING and create an unrecoverable "
+                    "coverage gap. Restart the agent or wait for a healthy secondary."
                 )
             tailing_node_ids.append(chosen.get("id"))
             config.write_host(
-                f"  {rs.get('id')} -> tailing on {chosen.get('id')} [{chosen.get('memberState')}]",
+                f"  {rs.get('id')} -> tailing on {chosen.get('id')} [{chosen.get('memberState')}] (agent active)",
                 fg=config.CYAN,
             )
 

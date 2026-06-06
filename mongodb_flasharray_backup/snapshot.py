@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -222,9 +223,38 @@ def _run(
         # ClusterDetail was already fetched in STEP 0 pre-flight.
         NodeIds: list[str] = []
 
+        # Agent-reachability pre-check (mirrors start_oplog_tailer): don't select a node whose automation
+        # agent is down to open the backup cursor on — OM's snapshotable flag lags a stopped agent by ~35s,
+        # so the cursor-open would stall the job. Confirm the agent is running on each candidate's host
+        # (SSH `systemctl is-active`); result cached per host.
+        _agent_state: dict[str, str] = {}
+
+        def _agent_active(node: dict) -> bool:
+            host = (node.get("id") or "").split(":")[0]
+            if host not in _agent_state:
+                proc = subprocess.run(
+                    ["ssh", *config.SSH_OPTS, f"{cfg.SshUser}@{host}",
+                     "systemctl is-active mongodb-mms-automation-agent"],
+                    capture_output=True,
+                    text=True,
+                )
+                _agent_state[host] = (proc.stdout or "").strip() or "unreachable"
+            st = _agent_state[host]
+            if st != "active":
+                config.write_host(
+                    f"    skipping {node.get('id')}: automation agent is '{st}' "
+                    f"(lastAgentPing={node.get('lastAgentPing')})",
+                    fg=config.YELLOW,
+                )
+            return st == "active"
+
         for RS in replica_sets:
+            # Snapshotable candidates whose automation agent is confirmed running.
             # Priority: hidden secondary > secondary > primary.
-            Candidates = [n for n in (RS.get("nodes") or []) if n.get("snapshotable") is True]
+            Candidates = [
+                n for n in (RS.get("nodes") or [])
+                if n.get("snapshotable") is True and _agent_active(n)
+            ]
             Chosen = next(
                 (n for n in Candidates if n.get("memberState") == "SECONDARY" and n.get("hidden") is True),
                 None,
@@ -232,12 +262,16 @@ def _run(
             if not Chosen:
                 Chosen = next((n for n in Candidates if n.get("memberState") == "SECONDARY"), None)
             if not Chosen:
-                Chosen = Candidates[0] if Candidates else None  # fall back to primary if no secondary
+                Chosen = Candidates[0] if Candidates else None  # agent-reachable primary fallback
             if not Chosen:
-                raise RuntimeError(f"No snapshotable node found for replica set {RS.get('id')}")
+                raise RuntimeError(
+                    f"No snapshotable node with a reachable automation agent for replica set "
+                    f"{RS.get('id')}. Refusing to open a backup cursor on a host whose agent is down "
+                    "(the snapshot job would stall). Restart the agent or wait for a healthy secondary."
+                )
             NodeIds.append(Chosen.get("id"))
             config.write_host(
-                f"  {RS.get('id')} -> {Chosen.get('id')} [{Chosen.get('memberState')}]", fg=config.CYAN
+                f"  {RS.get('id')} -> {Chosen.get('id')} [{Chosen.get('memberState')}] (agent active)", fg=config.CYAN
             )
 
         config.write_host(f"Selected {len(NodeIds)} nodes for snapshot.", fg=config.GREEN)
