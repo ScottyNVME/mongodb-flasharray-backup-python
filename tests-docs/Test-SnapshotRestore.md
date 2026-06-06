@@ -266,15 +266,20 @@ Run via `run-all-tests` (all three phases) against `aen-cluster` with the **hybr
 |---|---|---|---|
 | 1 — basic restore (no load) | ✅ PASS | `om-20260605-183119` | exact recovery — `loadtest` 2,159,780 / `payload` 200,000, **drift 0** |
 | 2 — restore under load | ✅ PASS | `om-20260605-183942` | post-restore `loadtest` 2,330,780 ∈ `[preSnap 2,330,180, postSnap 2,331,180]` (**drift 1000**); ~31k post-snapshot writes correctly lost (pre-drop was 2,361,980). Crash-consistency under ~334 docs/s confirmed. |
-| 3 — PITR under load | ⚠️ PASS (assertion only) | `om-20260605-185104` | T1 baseline restored correctly (`loadtest` 2,459,580 ∈ `[2,459,180, 2,459,980]`); range check passed (∈ `[preSnap, T2=2,511,180]`, `unrecoveredTail=51,600`) — **but oplog replay was a no-op; see note.** |
+| 3 — PITR under load | ✅ PASS (forward recovery, all 3 shards) | `om-20260605-195104` | restored to T1 (`loadtest` 2,819,246), replayed post-T1 segments on all three shards **including the config shard** → post-replay **2,853,446** = **+34,200 docs past T1**, ∈ `[preSnap 2,818,646, T2=2,872,846]`, `unrecoveredTail=19,400` (≈ the inherent ~1-min stop-window). **True forward PITR.** |
 
-**Test 3 — PITR caveat (OM oplog-stream backlog, not a code issue).** The tailer captured only stale segments —
-oplog from **2026-05-17 01:07–13:53 UTC** — while T1 was **2026-06-05 23:55 UTC**, a **~19-day** gap, so
-`invoke-oplog-replay` correctly filtered every segment as pre-T1 and the cluster stayed at the T1 restore state.
-Root cause: OM's oplog-snapshot stream cursor for this cluster is frozen at `2026-05-17T13:53` (where the prior
-run left it ~19 days earlier); a fresh tailer resumes from that cursor and replays the backlog oldest-first, so a
-short test window only partially drained `aen-shard_2` (766 files) and never reached `config`/`aen-shard_1`. The
-OM agent **is** producing current segments (on-disk date dirs `2026-05-17`, `2026-06-05`, `2026-06-06`, newest only
-~seconds behind the live oplog head), so the data exists — the stream cursor just hasn't advanced. A true
-forward-PITR demonstration requires advancing/resetting the OM oplog-snapshot stream cursor to ~current (OM-side),
-or running the tailer continuously long enough to drain the backlog, before taking T1.
+**Test 3 — forward-PITR notes.** Getting a *true* forward replay took three steps. The first attempt
+(`om-20260605-185104`) was a no-op: the OM oplog-snapshot stream was ~19 days stale (serving leftover `2026-05-17`
+segments while T1 was `2026-06-05`), so `invoke-oplog-replay` correctly filtered every captured segment as pre-T1.
+Running the tailer continuously brought the stream current — the OM agent was already producing current segments;
+the cursor just needed to advance past the stale backlog. A re-run (`om-20260605-192735`) then showed real forward
+recovery (+26,466 docs past T1) **but skipped the config shard** — surfacing a bug: the tailer wrote each shard's
+segment dir keyed by *replica-set id*, so the embedded config shard's oplog landed under `aen-shard_0/` while
+replay looked for it under the canonical *shard id* `config/`.
+
+**Fixed and confirmed.** The tailer now keys segment dirs by shard id (mapped from mongos `listShards`, falling
+back to rsId if mongos is unreachable) and replay tolerates either layout. The validated run above
+(`om-20260605-195104`) writes the config shard under `config/`, replays it with no "skipping shard" warning, and
+recovers across all three shards — leaving `unrecoveredTail=19,400`, which is now just the inherent stop-window
+(≈ `--interval-sec` × write-throughput ≈ one minute at ~330 docs/s), not a dropped shard. Shrink it further with a
+smaller `--interval-sec` or a brief quiesce before `stop-oplog-tailer`.

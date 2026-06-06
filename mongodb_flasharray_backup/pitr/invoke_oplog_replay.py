@@ -209,10 +209,17 @@ def _run(
         plan: list[dict] = []
         for s in shards:
             shard_id = s["shardId"]
+            # Segments are written under the canonical shard id. Older streams (and the tailer's
+            # best-effort fallback when mongos is unreachable) may key the dir by replica-set id instead
+            # — e.g. the embedded config shard's rsId "aen-shard_0" vs its shard id "config" — so fall
+            # back to the rsId dir if the shard-id dir is absent.
+            rs_id = (s.get("rsHosts") or "").split("/")[0]
             seg_dir = oplog_dir / shard_id / "segments"
+            if not seg_dir.exists() and rs_id and (oplog_dir / rs_id / "segments").exists():
+                seg_dir = oplog_dir / rs_id / "segments"
             if not seg_dir.exists():
                 config.write_host(
-                    f"  WARNING: no segments dir for {shard_id} at {seg_dir} - skipping shard",
+                    f"  WARNING: no segments dir for {shard_id} (looked in {shard_id}/ and {rs_id}/) - skipping shard",
                     fg=config.YELLOW,
                 )
                 continue

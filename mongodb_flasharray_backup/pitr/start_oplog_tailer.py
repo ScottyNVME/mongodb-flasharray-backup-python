@@ -10,7 +10,7 @@
 #   3. GET  /oplogSnapshot/{id}        -> poll until state = READY
 #   4. For each range in the READY response, for each RS node:
 #         scp each .oplogs file from the agent node to
-#         ~/mongo-oplog-stream/<SnapshotTag>/<rsId>/segments/
+#         ~/mongo-oplog-stream/<SnapshotTag>/<shardId>/segments/
 #   5. Check range.previousEnd against stored lastEnd (gap detection)
 #   6. POST /oplogSnapshot/{id}/finish -> OM deletes .oplog files asynchronously
 #   7. GET  /oplogSnapshot/{id}        -> poll until state = FINISHED
@@ -196,6 +196,30 @@ def _run(
             fg=config.GREEN,
         )
 
+        # Map replica-set id -> canonical shard id via mongos listShards. The OM oplog API identifies
+        # ranges by rsId, but snapshot and replay key per-shard artifacts by the canonical shard id
+        # (e.g. the embedded config shard's rsId is "aen-shard_0" but its shard id is "config"). Writing
+        # segment dirs under the shard id keeps the tailer consistent with replay. Best-effort: if mongos
+        # is unreachable, fall back to rsId for the dir name (replay tolerates either).
+        shard_id_by_rs: dict[str, str] = {}
+        try:
+            shard_json = config.invoke_mongosh_js(
+                ssh_target=config.CFG.MongosHost,
+                uri=f"mongodb://{config.CFG.MongosHost}:{config.CFG.MongosPort}",
+                js=config.LIST_SHARDS_JS,
+                context="listShards via mongos (rsId->shardId map)",
+            )
+            for sh in json.loads(shard_json):
+                rs_name = (sh.get("rsHosts") or "").split("/")[0]
+                if rs_name and sh.get("shardId"):
+                    shard_id_by_rs[rs_name] = sh["shardId"]
+            config.write_host(f"  Shard-id map (rsId->shardId): {shard_id_by_rs}", fg=config.CYAN)
+        except Exception as e:  # noqa: BLE001 - best-effort; fall back to rsId for dir naming
+            config.write_host(
+                f"  WARNING: could not build rsId->shardId map ({e}); segment dirs will use rsId",
+                fg=config.YELLOW,
+            )
+
         # Load existing state
         if state_file.exists():
             state = json.loads(state_file.read_text())
@@ -324,7 +348,8 @@ def _run(
                     for range_node in (range_.get("nodes") or []):
                         node_host = range_node.get("id").split(":")[0]
                         rs_id = range_node.get("rsId")
-                        seg_dir = root / rs_id / "segments"
+                        shard_key = shard_id_by_rs.get(rs_id, rs_id)
+                        seg_dir = root / shard_key / "segments"
                         seg_dir.mkdir(parents=True, exist_ok=True)
 
                         log_files = range_node.get("logFiles") or []
@@ -334,7 +359,7 @@ def _run(
                             local_name = os.path.basename(remote_file)
                             local_path = seg_dir / local_name
                             config.write_host(
-                                f"  [{_now_hms()}]  scp {node_host}:{remote_file} -> {rs_id}/{local_name}",
+                                f"  [{_now_hms()}]  scp {node_host}:{remote_file} -> {shard_key}/{local_name}",
                                 fg=config.CYAN,
                             )
                             proc = subprocess.run(
@@ -352,7 +377,7 @@ def _run(
                                     f"scp failed for {remote_file} from {node_host} (exit {proc.returncode})"
                                 )
                         config.write_host(
-                            f"  [{_now_hms()}]  {rs_id}: {len(log_files)} file(s)  "
+                            f"  [{_now_hms()}]  {shard_key}: {len(log_files)} file(s)  "
                             f"end={int(range_end['time'])}:{int(range_end['inc'])}",
                             fg=config.GREEN,
                         )
