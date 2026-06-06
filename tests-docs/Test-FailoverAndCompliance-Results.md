@@ -142,3 +142,27 @@ Add an agent-reachability pre-flight check in `start-oplog-tailer` before settin
 
 ---
 
+## Tests 6–11 — live validation (2026-06-05, hybrid gateway-routed client)
+
+Run against `aen-cluster` with `FA_ENDPOINT=sn1-x90r2-f06-27` (object/read ops routed through the Fusion
+gateway via `context_names`; tag ops direct per array). All snapshots/restores used the validated hybrid
+client. (Contrary to the 2026-05-16 Test 5 end-state above, all automation agents are healthy — every node
+reports `snapshotable=true`.)
+
+| Test | Result | Evidence |
+|---|---|---|
+| 6 — snapshot mid-flight interrupt → `/fail` | ✅ PASS | `SIGINT` after `/start` (PENDING) → `Calling /fail to release backup cursor on 6a23788c…` → `Backup cursor released`; OM job → `FAILING`/`FAILED`. *(Required resetting the SIGINT disposition to default before exec — background jobs inherit `SIGINT=ignore`; a harness detail, not a product issue.)* |
+| 7 — restore aborts on bad/incomplete target | ✅ PASS | `restore --snapshot-tag om-99991231-999999 --force` → `Snapshot '…' found on 0 of 3 expected arrays — aborting before any changes`. STEP 1 never reached → no destruction. *(Only the bad-tag pre-flight abort is meaningfully injectable; a literal node failure doesn't affect the storage-layer STEP 4 overwrite.)* |
+| 8 — PITR continuity across tailer bounce | ✅ PASS | Load → tailer → T1 → **bounce tailer** → continue → restore → replay. **0 gap markers** (continuity preserved); all 3 shards incl. `config/` replayed; post-restore 2,996,846 → **post-replay 3,021,646** ∈ `[preSnap 2,996,246, T2 3,089,246]`, `unrecoveredTail=67,600`. *(The bounce reselected the same preferred nodes — deterministic selection — so this proves restart-continuity; the optional forced-node-change variant was not run.)* |
+| 9 — oplog tailer node selection (3-node) | ✅ PASS | All 9 members `snapshotable=true, hidden=false`; `preferredOplogNodes` = one node per RS (e.g. `aen-mongo-01:27022`, `aen-mongo-02:27020`, `aen-mongo-01:27021`). |
+| 10 — restore validates target before destruction | ✅ PASS | Valid tag → STEP 0 prints `Snapshot found … on` all 3 arrays / `All 3 snapshots confirmed` / `Member verified … (size …)` ×3 / `All node volume members confirmed`; declined at the prompt → STEP 1 never reached → no destruction. |
+| 11 — oplog gap detection | ✅ PASS | Forced via a far-past `state.json` `lastEnd` → `gap-*.json` written with `detectedUtc`/`storedLastEnd`/`omPreviousEnd`/`jobId`; tailer logged `Oplog gap: stored lastEnd=(1000000000:1) but OM previousEnd=(…)`. |
+
+**Test 12 — not run (needs rewrite).** Its snapshot `/fail` injection (edit `OM_BASE_URL` in `.env` mid-run)
+does not work in the Python port — `config.load_config()` reads `.env` once at process start, so a mid-run edit
+has no effect (use Test 6's interrupt instead). Its oplog `/fail` expectation (`FAILED`) also contradicts the
+Test 5 finding that OM leaves stuck `PENDING` oplog jobs with `/fail` a no-op. The `/fail` paths themselves are
+covered by Tests 5 (oplog) and 6 (snapshot).
+
+---
+
