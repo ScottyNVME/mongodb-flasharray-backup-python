@@ -19,6 +19,8 @@ dive.
 
 ---
 
+> **New here?** Follow [QUICKSTART.md](QUICKSTART.md) for a step-by-step setup → snapshot → restore walkthrough.
+
 ## Install
 
 Requires **Python 3.11+** and the system OpenSSH client (`ssh`/`scp`) configured for key-based auth to every
