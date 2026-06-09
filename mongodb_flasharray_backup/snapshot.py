@@ -150,21 +150,36 @@ def _run(
 
         # Check that no OM snapshot job is currently in progress.
         ActiveStates = ["PENDING", "READY", "FINISHING", "THIRD_PARTY_SNAPSHOT_IN_PROGRESS", "FAILING"]
-        if ClusterDetail.get("snapshotId"):
-            ExistingJob = config.invoke_om_api(
-                path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/snapshot/{ClusterDetail.get('snapshotId')}"
-            )
-            if ExistingJob.get("state") in ActiveStates:
+        PrevSnapshotId = ClusterDetail.get("snapshotId")
+        if PrevSnapshotId:
+            try:
+                ExistingJob = config.invoke_om_api(
+                    path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/snapshot/{PrevSnapshotId}"
+                )
+            except Exception as e:  # noqa: BLE001
+                # After a topology change (shard added/removed), OM can transiently report
+                # THIRD_PARTY_DISCOVERY_ERROR or fail to return the prior snapshot whose recorded
+                # topology no longer matches the current cluster. That prior job is not active, so
+                # the pre-check must not block a new snapshot — proceed with a warning. (A genuinely
+                # active job would still be rejected by OM at create time, so this is safe.)
+                config.write_host(
+                    f"  OM snapshot check: could not read prior snapshot '{PrevSnapshotId}' ({e}); "
+                    "treating as no active job and proceeding (expected after a topology change).",
+                    fg=config.YELLOW,
+                )
+                ExistingJob = None
+            if ExistingJob and ExistingJob.get("state") in ActiveStates:
                 raise RuntimeError(
-                    f"OM snapshot job '{ClusterDetail.get('snapshotId')}' is already in progress "
+                    f"OM snapshot job '{PrevSnapshotId}' is already in progress "
                     f"(state={ExistingJob.get('state')}). Wait for it to finish or call /fail to release "
                     "the cursor before starting a new snapshot."
                 )
-            config.write_host(
-                f"  OM snapshot check: no active job (last={ClusterDetail.get('snapshotId')}, "
-                f"state={ExistingJob.get('state')})",
-                fg=config.GREEN,
-            )
+            if ExistingJob:
+                config.write_host(
+                    f"  OM snapshot check: no active job (last={PrevSnapshotId}, "
+                    f"state={ExistingJob.get('state')})",
+                    fg=config.GREEN,
+                )
         else:
             config.write_host("  OM snapshot check: no previous snapshot job on record.", fg=config.GREEN)
 

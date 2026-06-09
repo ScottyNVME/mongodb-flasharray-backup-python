@@ -283,3 +283,38 @@ back to rsId if mongos is unreachable) and replay tolerates either layout. The v
 recovers across all three shards — leaving `unrecoveredTail=19,400`, which is now just the inherent stop-window
 (≈ `--interval-sec` × write-throughput ≈ one minute at ~330 docs/s), not a dropped shard. Shrink it further with a
 smaller `--interval-sec` or a brief quiesce before `stop-oplog-tailer`.
+
+### Re-baseline + zero-tail forward PITR (2026-06-08, tag `om-20260608-165149`)
+
+A clean re-run that drives `unrecoveredTail` to **0** and isolates the cause of the residual tail.
+
+**Re-baseline first.** The OM oplog-snapshot stream had again gone stale (cursor ~66.8 h behind while the oplog
+head was current). The stream is a continuous chain — each `oplogSnapshot` job spans `[previousEnd → head]`, the
+create call takes no start param, and the cursor advances only on `/finish` — so it cannot "jump to now." Toggling
+`preferredOplogNodes` (empty list then re-set) does **not** re-baseline (verified: cursor unchanged; node toggling
+only picks *which* node tails). What works is a **skip-forward**: create one oplog snapshot spanning
+`[stale cursor → now]` and `/finish` it **without copying** the backlog — OM's `/finish` sends an empty body and
+never verifies the copy, so the cursor advances to `now` and OM async-deletes the uncopied files. This permanently
+discards PIT coverage for the skipped window (here 11,991 segments, 2026-06-06→06-08), so use it only when that
+backlog is intentionally dropped. Result: cursor 66.8 h-behind → 0.1 h-behind in seconds.
+
+**Then the PIT test, with a drain.** drop `testdb` → load A (`loadtest`=20,000) → start tailer → T1 snapshot →
+load B (60 s) → **drain** (keep tailing until the captured `lastEnd` passes the load-stop epoch) → stop → restore →
+replay-all.
+
+| Metric | Value |
+|---|---|
+| A (snapshot point) | 20,000 |
+| B_total (live at ~T2) | 39,600 |
+| post-restore (T1) | 20,000 — restore lands **exactly** at the snapshot |
+| post-replay | **39,600 — full recovery, `unrecoveredTail=0`** |
+| gap markers | 0 |
+
+**Why the drain matters (the residual-tail cause).** OM `.oplog` segments become available ~2–3 min *after* the
+writes (60 s windows + agent/OM processing). Verified here: the tailer's last job finished at wall-clock 16:45:20
+but the newest available segment ended at 16:43:00 — a ~2m20s lag. A first pass that stopped the tailer immediately
+after the load recovered only 36,000 of ~49,200 (`unrecoveredTail=13,200`); the drain pass — waiting until
+`lastEnd` (epoch 1780952520) passed the load-stop time (1780952496) — recovered **all** of B. So the residual tail
+is **capture lag, not a restore/replay defect**: `invoke-oplog-replay` applies 100% of captured segments in order,
+0 gaps. Continuous production tailing already keeps the stream current; only a PIT *test harness* needs the explicit
+drain wait before relying on a recovery target.

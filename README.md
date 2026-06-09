@@ -83,7 +83,7 @@ Run `<command> --help` for full option details.
 | `remove-old-artifacts` | Retention cleanup of old FA snapshots + local oplog/log dirs. `--older-than-days` (required, 1–365), `--what-if`. |
 | `start-oplog-tailer` | Continuously capture oplog `.oplogs` segments for PITR. `--snapshot-tag`, `--interval-sec`, `--timeout-minutes`, `--poll-interval-sec`, `--abort-on-gap`. |
 | `stop-oplog-tailer` | Stop the tailer (`.stop` sentinel) and capture the T2 mark. `--snapshot-tag`, `--wait-sec`, `--baseline-database`, `--baseline-collections`. |
-| `invoke-oplog-replay` | Replay oplog segments to a target timestamp after a restore. `--snapshot-tag`, `--target-timestamp`, `--verify-database`, `--t2-mark-path`, `--skip-verification`. |
+| `invoke-oplog-replay` | Replay oplog segments to a target timestamp after a restore. Refuses if oplog gap markers are present (`--allow-gaps` to override). `--snapshot-tag`, `--target-timestamp`, `--verify-database`, `--t2-mark-path`, `--skip-verification`, `--allow-gaps`. |
 | `initialize-test-data` | Seed `testdb.loadtest`/`payload` (hashed `_id` sharding). `--loadtest-docs`, `--payload-docs`, `--batch-size`, `--force`. |
 | `start-insert-load` | Continuous insert load generator. `--max-docs`, `--batch-size`. |
 | `run-all-tests` | 3-phase e2e suite (restore / restore-under-load / PITR). `--start-at-test`, `--stop-after-test`. |

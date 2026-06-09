@@ -93,6 +93,11 @@ def _run(
         "--skip-verification",
         help="opt out of post-replay range-bound assertion (counts are still printed)",
     ),
+    allow_gaps: bool = typer.Option(
+        False,
+        "--allow-gaps",
+        help="proceed even if oplog gap markers are present (PIT coverage in the gap window is unrecoverable)",
+    ),
 ):
     # Load config FIRST (throws without .env).
     config.load_config()
@@ -115,6 +120,30 @@ def _run(
             raise RuntimeError(
                 f"Oplog stream directory not found at {oplog_dir}. Run start-oplog-tailer first."
             )
+
+        # Gap pre-check (validate no oplog gaps before a PIT restore): the tailer writes a
+        # gap-<timestamp>.json marker whenever oplog continuity (previousEnd) breaks. PIT coverage across
+        # such a window is unrecoverable, so refuse to replay unless explicitly overridden.
+        gap_files = sorted(oplog_dir.glob("gap-*.json"))
+        if gap_files:
+            details = []
+            for g in gap_files:
+                try:
+                    gd = json.loads(g.read_text())
+                    details.append(
+                        f"    {g.name}: storedLastEnd={gd.get('storedLastEnd')} omPreviousEnd={gd.get('omPreviousEnd')}"
+                    )
+                except Exception:  # noqa: BLE001
+                    details.append(f"    {g.name}")
+            msg = (
+                f"{len(gap_files)} oplog gap marker(s) present in {oplog_dir} — PIT coverage is incomplete; "
+                "replay to a point inside/after a gap is unrecoverable:\n" + "\n".join(details)
+            )
+            if not allow_gaps:
+                raise RuntimeError(
+                    msg + "\n  Re-run with --allow-gaps to replay anyway (only data up to the first gap is trustworthy)."
+                )
+            config.write_host(f"  WARNING: {msg}\n  Proceeding due to --allow-gaps.", fg=config.YELLOW)
 
         # Header + replay target description.
         config.write_host(f"\n=== Oplog Replay for snapshot {snapshot_tag} ===", fg=config.YELLOW)
