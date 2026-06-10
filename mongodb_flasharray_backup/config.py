@@ -674,11 +674,22 @@ def resolve_fa_context_names(fa: Any, pg_name: str) -> list[str]:
     contexts_with_pg: list[str] = []
     for array_name in flasharray_names:
         pg = _fa(fa.get_protection_groups(context_names=[array_name], names=[pg_name]), allow_error=True)
-        if pg:
-            contexts_with_pg.append(array_name)
-            write_host(f"    {array_name}: PG '{pg_name}' present", fg=CYAN)
-        else:
+        if not pg:
             write_host(f"    {array_name}: PG '{pg_name}' NOT found", fg=DARK_GRAY)
+            continue
+        # The PG can exist on a fleet array but hold no volumes (e.g. after a node/shard removal +
+        # prune left the PG empty on that array). Snapshotting an empty PG fails ("Protection group
+        # has no volumes to snapshot"), and restore would expect a snapshot there that never gets
+        # taken. Only treat an array as a backup target if its PG actually has volume members.
+        members = _fa(
+            fa.get_protection_groups_volumes(context_names=[array_name], group_names=[pg_name]),
+            allow_error=True,
+        )
+        if members:
+            contexts_with_pg.append(array_name)
+            write_host(f"    {array_name}: PG '{pg_name}' present ({len(members)} volume(s))", fg=CYAN)
+        else:
+            write_host(f"    {array_name}: PG '{pg_name}' present but EMPTY (no volumes) - skipping", fg=DARK_GRAY)
     if len(contexts_with_pg) == 0:
         raise RuntimeError(
             f"No FlashArrays found with protection group '{pg_name}'. Run initialize-protection-groups first."
