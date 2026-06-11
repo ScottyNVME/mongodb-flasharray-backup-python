@@ -1,14 +1,14 @@
 # Quick Start
 
 A step-by-step guide to set up **mongodb-flasharray-backup**, take a crash-consistent snapshot of a
-MongoDB sharded cluster on Pure Storage FlashArray, and restore it. New to the project? Start here, then
-see [README.md](README.md) for full command reference and [docs/how-it-works.md](docs/how-it-works.md) for
-the recoverability deep dive.
+MongoDB **sharded cluster or standalone replica set** on Pure Storage FlashArray, and restore it. New to the
+project? Start here, then see [README.md](README.md) for full command reference and
+[docs/how-it-works.md](docs/how-it-works.md) for the recoverability deep dive.
 
-> **The 30-second mental model:** Ops Manager opens a `$backupCursor` on one secondary per shard (pinning a
-> consistent point), and while it's held, the tool takes a FlashArray protection-group snapshot on every
-> array at once. Restore overwrites each node's volume from that snapshot in place. No `fsyncLock`, no
-> write stall.
+> **The 30-second mental model:** Ops Manager opens a `$backupCursor` on one snapshotable secondary per replica
+> set (each shard, or the single RS — pinning a consistent point), and while it's held, the tool takes a
+> FlashArray protection-group snapshot on every array at once. Restore overwrites each node's volume from that
+> snapshot in place. No `fsyncLock`, no write stall.
 
 ---
 
@@ -16,10 +16,13 @@ the recoverability deep dive.
 
 You need all of these in place first (one-time, usually by an admin):
 
-- [ ] **A MongoDB 8.0 sharded cluster** managed by **Ops Manager 8.0**, one data volume per node mounted at
-      `/data/mongo` (no LVM), each volume on a **FlashArray** enrolled in the same **Pure Storage Fusion fleet**.
+- [ ] **A MongoDB 8.0 sharded cluster *or* standalone replica set** managed by **Ops Manager 8.0**, one data
+      volume per node mounted at `/data/mongo` (no LVM), each volume on a **FlashArray** enrolled in the same
+      **Pure Storage Fusion fleet**.
 - [ ] **Ops Manager third-party backup enabled** and the cluster **registered / `ACTIVE`**
-      (see [docs/third-party-backup-reference.md](docs/third-party-backup-reference.md), Steps 1–7).
+      (see [docs/third-party-backup-reference.md](docs/third-party-backup-reference.md), Steps 1–7). *For a
+      replica set, register it via the third-party `…/clusters/{id}/manage` endpoint — no OM snapshot store is
+      needed; the standard `backupConfigs statusName=STARTED` path 409s `Could not find available Snapshot Store`.*
 - [ ] **SSH key-based auth** from the machine you run this on to **every cluster node** as one user
       (`SSH_USER`), with **passwordless `sudo`**. Test: `ssh <SSH_USER>@<node> sudo -n true`.
 - [ ] **An Ops Manager API key** (public/private) with role **`GLOBAL_BACKUP_ADMIN`**, and your IP on its
@@ -57,21 +60,41 @@ Fill in (the tool finds `.env` via `$MONGO_FA_BACKUP_ENV`, else the current dire
 |---|---|
 | `FA_ENDPOINT` | The **gateway** FlashArray FQDN that can reach all fleet members (e.g. `sn1-x90r2-f06-27.example.com`). |
 | `FA_USERNAME` + `FA_PASSWORD` | Directory login that authorizes fleet-wide *(preferred)*. **Or** set `FA_APITOKEN` for single-array use. |
-| `FA_API_VERSION` | FlashArray REST API version (e.g. `2.39`). |
-| `FA_PROTECTION_GROUP` | Name to use for the MongoDB protection group (e.g. `aen-mongodb-pg`). |
+| `FA_API_VERSION` | FlashArray REST API version (e.g. `2.51`). |
+| `TOPOLOGY` | `sharded` (default) or `replicaset` — see the multi-deployment note below. |
+| `FA_PROTECTION_GROUP` | Protection group name; convention `<cluster-name>-pg` (e.g. `aen-cluster-pg`). |
 | `FA_CLUSTER_NAME` | Logical name for your cluster (used in tags/labels). |
 | `OM_BASE_URL` | Ops Manager URL, e.g. `http://opsmgr.example.com:8080`. |
-| `OM_API_VERSION` | OM public API version (e.g. `1.0`). |
+| `OM_API_VERSION` | OM public API version (e.g. `v1.0`). |
 | `OM_GROUP_ID` | OM **Project** ID — Project Settings, or the `/groups/<id>/` segment in the OM URL. |
-| `OM_CLUSTER_ID` | The sharded **cluster** ID — from `GET /groups/{groupId}/clusters` or the deployment URL. |
+| `OM_CLUSTER_ID` | The OM **cluster** ID (sharded cluster *or* replica set) — from `GET /groups/{groupId}/clusters`. |
 | `OM_PUBLIC_KEY` / `OM_PRIVATE_KEY` | The OM API key pair from step 0. |
 | `MONGOSH_PATH` | Path to `mongosh` on the cluster nodes (the OM-managed agent ships one, e.g. `/var/lib/mongodb-mms-automation/mongosh-*/bin/mongosh`). |
-| `MONGOS_HOST` / `MONGOS_PORT` | A `mongos` router to query (e.g. `aen-mongo-01` / `27017`). |
+| `MONGOS_HOST` / `MONGOS_PORT` | **Sharded:** a `mongos` router (e.g. `aen-mongo-01` / `27017`). **Replica set:** any RS member (counts/probes run there). |
 | `SSH_USER` | The SSH user with passwordless sudo on every node. |
 | `MONGO_TOOLS_BASE` | Path to the MongoDB Database Tools (`mongodump`/`mongorestore`/decoder) on the nodes. |
-| `CLUSTER_NODES` *(optional)* | Comma-separated node hostnames — a fallback used only if Ops Manager is unreachable. |
+| `CLUSTER_NODES` *(optional)* | Comma-separated node hostnames — a fallback used only if Ops Manager is unreachable. `initialize-protection-groups` refreshes it from OM on each run. |
 
 > Keep `.env` out of git (it holds secrets) — it's already in `.gitignore`.
+
+**Multiple deployments (sharded + replica set) in one `.env`.** Shared infra stays in the flat keys above;
+deployment-specific keys can be overridden per deployment with a `<NAME>__` prefix and selected with
+`--deployment <name>` on any command (omit for the default/flat deployment). Set `TOPOLOGY=replicaset` for a
+standalone replica set (no `mongos`; point `MONGOS_HOST` at any RS member). Example:
+
+```
+# default (flat) deployment = sharded
+TOPOLOGY=sharded
+FA_PROTECTION_GROUP=aen-cluster-pg
+OM_CLUSTER_ID=<sharded-cluster-id>
+MONGOS_HOST=aen-mongo-01
+# second deployment, used with: --deployment aen-rs-00
+AEN_RS_00__TOPOLOGY=replicaset
+AEN_RS_00__FA_PROTECTION_GROUP=aen-rs-00-pg
+AEN_RS_00__OM_CLUSTER_ID=<rs-cluster-id>
+AEN_RS_00__MONGOS_HOST=aen-mongo-05.fsa.lab
+```
+See [.env.example](.env.example) for the full template.
 
 ---
 
@@ -134,10 +157,11 @@ restore-mongo-snapshot --snapshot-tag om-20260512-143022 --force
 What happens: STEP 0 validates the snapshot is restorable (present on every array, every member, size match)
 → stops agents/mongod → unmounts `/data/mongo` → overwrites each FA volume from the snapshot (sub-second CoW
 swap) → remounts → restarts agents (WiredTiger crash-recovers) → waits for the cluster to stabilize → verifies
-document counts.
+document counts. For a **sharded** cluster it additionally connects to each shard's RS and confirms the shards
+physically hold the data (per-shard totals account for the mongos aggregate); a replica set verifies directly.
 
 Success looks like: `mongos up, N shards registered, N primaries reachable`, then
-`Baseline OK : testdb.loadtest = … (drift=0)` and `Restore Complete`.
+`Baseline OK : testdb.loadtest = … (drift=0)`, the per-shard distribution, and `Restore Complete`.
 
 Useful flags: `--verify-database <db>` to count a specific DB, `--skip-verification` to skip the count check.
 

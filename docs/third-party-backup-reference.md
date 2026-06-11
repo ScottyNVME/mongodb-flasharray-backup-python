@@ -83,7 +83,9 @@ Verify (e.g. via `stat`) that the agent on each node can read and write to the o
 
 ### Step 7 — Mark the cluster as Managed
 
-Navigate to **Continuous Backup**, hover over the status of the target cluster and click **Manage**. The status will change to **Third Party Managed**. This can also be done via the API (`POST .../manage`).
+Navigate to **Continuous Backup**, hover over the status of the target cluster and click **Manage**. The status will change to **Third Party Managed**. This can also be done via the API (`POST .../clusters/{id}/manage`).
+
+> **Replica sets:** `POST .../clusters/{id}/manage` is the correct enable path for a standalone replica set too — it needs **no OM snapshot store** (the FlashArray holds the snapshots). Supply a `syncSource` (an RS secondary) if OM requests one. Do **not** use the OM-*managed* path (`PATCH .../backupConfigs {statusName: STARTED}`) for third-party backup; it 409s `Could not find available Snapshot Store`.
 
 ### Step 8 — Integrate your third-party software
 
@@ -386,15 +388,20 @@ OM does not automatically start tailing another node. The client must select a n
 
 ## Testing Checklist
 
+> **Live status for *this* implementation is tracked in
+> [../tests-docs/Test-CertificationChecklist.md](../tests-docs/Test-CertificationChecklist.md)** (the raw MongoDB
+> checklist below, mapped to the tool with recorded results). Annotated here: ✅ validated · 🟡 supported, not yet
+> run · ❌ out of scope for this tool (in-place self-restore + full snapshots only).
+
 ### Replica Set Testing
 
 **Full Snapshot Restore — Non-Incremental**
-- [ ] Self Restore Replica Set
-- [ ] Restore Replica Set to different Replica Set
-- [ ] Restore Replica Set to different Ops Manager
+- [x] Self Restore Replica Set — ✅ validated on `aen-rs-00` (drift 0, point-in-time fidelity proof)
+- [ ] Restore Replica Set to different Replica Set — ❌ in-place self-restore only
+- [ ] Restore Replica Set to different Ops Manager — ❌
 
 **PIT Restore — Non-Incremental**
-- [ ] PIT Restore Replica Set to self
+- [ ] PIT Restore Replica Set to self — 🟡 supported; needs the `replicaset` branch in tailer/replay
 - [ ] Restore Replica Set to different Replica Set
 - [ ] Restore Replica Set with Encryption at Rest to different Replica Set
 - [ ] PIT Restore Replica Set to different Replica Set with Arbiter

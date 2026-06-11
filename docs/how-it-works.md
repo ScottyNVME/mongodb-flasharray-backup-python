@@ -131,7 +131,8 @@ Because FlashArray takes volume-level snapshots, the `fileList` / `fileDiffs` st
 
 ```
 1. GET  /group/{groupId}/clusters/{clusterId}
-         → identify snapshotable nodes (one per shard + config RS)
+         → identify snapshotable nodes from the cluster detail's replicaSets
+           (one per shard + config RS for a sharded cluster; the single RS for a replica set)
          → select: hidden secondary > secondary > primary; prefer most recent opTime
 
 2. POST /group/{groupId}/clusters/{clusterId}/snapshot
@@ -170,11 +171,21 @@ Because FlashArray takes volume-level snapshots, the `fileList` / `fileDiffs` st
 3. Most recent `opTime` — aligns shard timestamps
 4. Hidden secondary > secondary > primary — minimizes production impact
 
-### Sharded cluster requirements
+### Topology requirements (sharded *and* replica set)
 
-- `nodeIds` must include **exactly one node from each shard AND the config replica set**
-- For `aen-cluster`: one node from each of `aen-shard_0`, `aen-shard_1`, `aen-shard_2`
-- Node ID format: `"hostname:port"` e.g. `"aen-mongo-01:27020"`
+Node selection is **topology-agnostic**: it iterates the cluster detail's `replicaSets` array (the third-party
+backup view), **not** `listShards`. The same code path covers both deployment types:
+
+- **Sharded cluster** — `nodeIds` includes **exactly one snapshotable node from each shard's RS AND the config
+  RS**. For `aen-cluster` (dedicated config): one node from each of `aen-shard_0` (config), `aen-shard_1`,
+  `aen-shard_2`, `aen-shard_3`.
+- **Standalone replica set** (`TOPOLOGY=replicaset`, selected with `--deployment <name>`) — the cluster detail
+  returns a single `replicaSet`; `nodeIds` is one snapshotable member of it.
+- Node ID format: `"hostname:port"` — e.g. `"aen-mongo-01:27021"` (sharded) or `"aen-mongo-06.fsa.lab:27017"` (RS).
+
+`TOPOLOGY` only affects the two `mongos`/`listShards` call sites elsewhere — the restore-stabilization wait
+(replica-set mode verifies the single RS has a writable primary instead of `listShards`) and the PIT oplog
+anchors. Snapshot node-selection above is identical for both, and the sharded paths are byte-for-byte unchanged.
 
 ### Full vs. incremental snapshots
 
@@ -357,8 +368,9 @@ Because the mapping is derived entirely from kernel and storage APIs at runtime,
 | All `/backup/third_party/` calls return HTTP 404 | `mms.featureFlag.backup.thirdPartyManaged` is stored in the AppDB but API routes are only registered at startup | Restart Ops Manager: `sudo systemctl restart mongodb-mms` and wait ~2–3 min for JVM warmup |
 | `/manage` returns `THIRD_PARTY_CLUSTER_ALREADY_MANAGED` | Cluster was already registered | Not an error — cluster is active |
 | Backup agents stuck on `standby` in Deployment → Servers | No snapshot job assigned yet; agents activate when a snapshot is in progress | Expected with third-party backup |
-| `THIRD_PARTY_DISCOVERY_ERROR` from snapshot pre-flight | Third-party backup must be re-activated after any topology change | In OM UI: **Servers → select new node → enable Backup and Monitoring → Deploy Changes**, then retry |
-| Snapshot job stuck in `PENDING` | A prior run left a dangling job | Call `/fail` via the OM API — e.g. `config.invoke_om_api(method="POST", path="group/{GroupId}/clusters/{ClusterId}/snapshot/<id>/fail")`. Poll until `FAILED`, then re-run. |
+| `THIRD_PARTY_DISCOVERY_ERROR` (snapshot pre-flight or snapshot-detail GET) | OM's backup coordinator can't reconcile its shard map after a topology change (shard add/remove, **dedicated-config-server migration**) | A UI re-enable is usually **not** enough — use the **force-unmanage recovery**: stop any orphaned old mongods + `DELETE` their stale OM monitoring hosts → delete the active `backupjobs` config docs (`clusters`/`jobs`/`thirdparty.jobs`, history kept) → `systemctl restart mongodb-mms` → `POST …/manage`. Also add any new node's data volume to the PG (`initialize-protection-groups`). See `tests-docs/Test-CertificationChecklist.md` and issues #1/#2. |
+| Snapshot job stuck in `PENDING` | OM can't open the `$backupCursor` (selected node's agent down, or backup wedged by a topology change) | **Do NOT `/fail` a PENDING third-party snapshot** — OM turns it into a globally-blocking `FAILING` wedge. Instead `kill -9` the snapshot client (skips the `finally`→`/fail`), confirm the agent is running on the selected node (`systemctl is-active mongodb-mms-automation-agent`), and if it's a topology-change wedge, run the force-unmanage recovery (row above). |
+| `Could not find available Snapshot Store` when enabling RS backup | Used the OM-**managed** path (`PATCH backupConfigs statusName=STARTED`) for a third-party replica set | Enable third-party backup via `POST …/clusters/{id}/manage` (with a `syncSource` = an RS secondary). The FlashArray holds the snapshots, so **no OM snapshot store is needed**. |
 
 ---
 

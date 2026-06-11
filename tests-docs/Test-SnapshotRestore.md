@@ -2,6 +2,11 @@
 
 Validates the end-to-end snapshot and restore flow for the `aen-cluster` sharded cluster.
 
+> **Replica-set deployments:** the same procedure applies to a standalone replica set — append `--deployment <name>`
+> to every `new-mongo-snapshot` / `restore-mongo-snapshot` call, and point the `mongosh` helper at an RS member
+> instead of `mongos`. A worked RS run (snapshot → mutate → restore → drift 0 with a sentinel-collection fidelity
+> check) is recorded in [Test-CertificationChecklist.md](Test-CertificationChecklist.md) §1.A.a.
+
 > **Run each step manually in separate terminals.** Multi-stage workflows that combine a long-running background process (e.g. `start-insert-load`) with a foreground operation (e.g. `new-mongo-snapshot`) in the same pipeline will deadlock — the parent shell waits for stdout to drain before reading the next pipe stage, and both sides block. Each process must run in its own independent terminal with no shared pipe.
 
 > See [System Requirements](../README.md#system-requirements) in the README for storage and SSH prerequisites that must be satisfied before running these tests.

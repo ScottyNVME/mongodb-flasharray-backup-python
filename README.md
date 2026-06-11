@@ -1,14 +1,18 @@
 # MongoDB Snapshot & PITR — Pure Storage FlashArray + Fusion + Ops Manager (Python)
 
-Crash-consistent snapshot backup and point-in-time recovery of a MongoDB 8.0 Enterprise **sharded cluster**
-using Pure Storage FlashArray, **Pure Storage Fusion**, and **MongoDB Ops Manager 8.0**. (Python implementation
-of [`nocentino/mongodb-flasharray-backup`](https://github.com/nocentino/mongodb-flasharray-backup).)
+Crash-consistent snapshot backup and point-in-time recovery of a MongoDB 8.0 Enterprise **sharded cluster or
+standalone replica set** using Pure Storage FlashArray, **Pure Storage Fusion**, and **MongoDB Ops Manager 8.0**.
+(Python implementation of [`nocentino/mongodb-flasharray-backup`](https://github.com/nocentino/mongodb-flasharray-backup).)
+
+A single `.env` can describe **multiple deployments** (e.g. a sharded cluster *and* a standalone replica set);
+pick one per run with `--deployment <name>`. See [Configure](#configure).
 
 Each MongoDB node's data volume lives on a FlashArray, and the arrays are enrolled in a Pure Storage Fusion
 fleet. The toolkit talks to the arrays over the **FlashArray REST API**, connecting **directly to each fleet
 member** (`fa_rest.py`) and authenticating fleet-wide with a directory account (`FA_USERNAME`/`FA_PASSWORD`) so
 every array is reachable. `new-mongo-snapshot` uses the Ops Manager Third-Party Backup API to open a
-`$backupCursor` on one secondary per shard (pinning the WiredTiger checkpoint and freezing journal cleanup);
+`$backupCursor` on one snapshotable secondary per replica set — each shard's RS for a sharded cluster, or the
+single RS for a standalone replica set (pinning the WiredTiger checkpoint and freezing journal cleanup);
 while the cursor is open, a FlashArray protection-group snapshot is taken on every array in a coordinated
 crash-consistent sweep — no `fsyncLock`, no write stall. `restore-mongo-snapshot` stops agents, unmounts,
 overwrites each volume in-place from the snapshot (a sub-second CoW pointer swap), remounts, and restarts
@@ -61,27 +65,53 @@ unreachable).
 The `.env` is located via `$MONGO_FA_BACKUP_ENV`, else python-dotenv's search from the current directory, else
 `./.env`. A missing file or required key raises immediately.
 
+### Multiple deployments in one `.env` (sharded + replica set)
+
+A **deployment** is one MongoDB cluster backed by one FlashArray protection group. Shared infrastructure
+(FA/OM credentials, `SSH_USER`, tool paths) stays in the flat keys; the **deployment-specific** keys —
+`TOPOLOGY`, `OM_CLUSTER_ID`, `FA_PROTECTION_GROUP`, `FA_CLUSTER_NAME`, `MONGOS_HOST`/`MONGOS_PORT`,
+`CLUSTER_NODES` — can be overridden per deployment with a **`<NAME>__` prefix** (NAME upper-cased,
+hyphens → underscores) and selected with **`--deployment <name>`** on any command. With no `--deployment`, the
+flat keys are used as-is (backward compatible with a single-deployment `.env`).
+
+- **`TOPOLOGY`** is `sharded` (topology discovered/validated via `mongos`/`listShards`) or `replicaset` (a
+  standalone replica set — no `mongos`; set `MONGOS_HOST` to **any RS member**, where document counts and the
+  restore-stabilization probe run).
+- Protection groups follow a `<cluster-name>-pg` convention (e.g. `aen-cluster-pg`, `aen-rs-00-pg`).
+
+```bash
+new-mongo-snapshot                          # default deployment (flat keys)
+new-mongo-snapshot --deployment aen-rs-00   # the AEN_RS_00__* deployment
+```
+
+See [.env.example](.env.example) for a worked two-deployment example.
+
 ## Prerequisites
 
 - Python 3.11+ and the OpenSSH client; SSH key auth from this machine to every `SSH_USER@<node>` (passwordless `sudo`).
 - All FlashArrays enrolled in the same Pure Storage Fusion fleet.
 - Ops Manager API user with role `GLOBAL_BACKUP_ADMIN` and a public/private API key (HTTP Digest auth).
 - Ops Manager [third-party backup](https://www.mongodb.com/docs/ops-manager/current/core/third-party-backup/)
-  enabled and the cluster registered (state = `ACTIVE`).
-- Protection groups initialized on all FlashArrays (`initialize-protection-groups`).
-- A single data volume per node mounted at `/data/mongo` (no LVM).
+  enabled and the cluster registered (state = `ACTIVE`). For a **replica-set** deployment, register it via the
+  third-party `…/clusters/{id}/manage` endpoint — **no OM snapshot store is required** (the FlashArray holds the
+  snapshots). The standard `backupConfigs statusName=STARTED` path is OM-managed backup and will 409
+  `Could not find available Snapshot Store`.
+- Protection groups initialized on all FlashArrays (`initialize-protection-groups`, run per deployment).
+- A single data volume per node mounted at `/data/mongo` (no LVM) — the validated layout.
 
 ---
 
 ## Commands
 
-Run `<command> --help` for full option details.
+Run `<command> --help` for full option details. `new-mongo-snapshot`, `restore-mongo-snapshot`, and
+`initialize-protection-groups` accept **`--deployment <name>`** to select a deployment from the `.env` (omit for
+the default/flat deployment).
 
 | Command | Purpose |
 |---|---|
 | `initialize-protection-groups` | Create the PG on every fleet array and add data volumes. `--what-if`, `--prune`, `--force`. |
 | `new-mongo-snapshot` | Take a crash-consistent FlashArray PG snapshot across all nodes via the backup-cursor window. `--snapshot-tag`, `--baseline-database`, `--baseline-collections`. |
-| `restore-mongo-snapshot` | Destructive in-place restore from a snapshot tag. `--snapshot-tag` (required), `--force`, `--verify-database`, `--skip-verification`. |
+| `restore-mongo-snapshot` | Destructive in-place restore from a snapshot tag. Verifies baseline counts; **sharded restores also verify per-shard data distribution** (each shard's RS counted directly, sums account for the mongos aggregate). `--snapshot-tag` (required), `--force`, `--verify-database`, `--skip-verification`. |
 | `remove-old-artifacts` | Retention cleanup of old FA snapshots + local oplog/log dirs. `--older-than-days` (required, 1–365), `--what-if`. |
 | `start-oplog-tailer` | Continuously capture oplog `.oplogs` segments for PITR. `--snapshot-tag`, `--interval-sec`, `--timeout-minutes`, `--poll-interval-sec`, `--abort-on-gap`. |
 | `stop-oplog-tailer` | Stop the tailer (`.stop` sentinel) and capture the T2 mark. `--snapshot-tag`, `--wait-sec`, `--baseline-database`, `--baseline-collections`. |
@@ -151,6 +181,11 @@ SCSI-serial selection, oplog decode). The end-to-end orchestration is installed 
   error becomes an empty result (for best-effort reads) or raises (for required operations).
 - **Ops Manager auth** uses a manual RFC 2617 Digest flow over `requests`.
 - **Topology and storage mappings are discovered at runtime** — cluster nodes from Ops Manager (with a
-  `CLUSTER_NODES` fallback), and node→array→volume mappings from SCSI serial numbers — so the workflow adapts
-  automatically as nodes or arrays are added or removed.
+  `CLUSTER_NODES` fallback that `initialize-protection-groups` keeps current), and node→array→volume mappings
+  from SCSI serial numbers — so the workflow adapts automatically as nodes or arrays are added or removed.
+- **Topology-agnostic by design.** Snapshot node-selection iterates the Ops Manager third-party cluster
+  detail's `replicaSets` (not `listShards`), so it works for sharded clusters and standalone replica sets
+  alike. The only `mongos`/`listShards` call sites — the restore-stabilization wait and the PIT oplog anchors —
+  branch on `TOPOLOGY` (`replicaset` verifies the single RS's writable primary directly); the sharded paths are
+  unchanged.
 - **Remote execution** shells out to system `ssh`/`scp`; logging is teed to console and file.

@@ -20,21 +20,28 @@ per-item status and rationale follow in the sections below.
 | **3.a** Node down before snapshot / oplog snapshot | ✅ Pass | Agent-reachability pre-check (`ssh systemctl is-active`) routes around a down agent or fails loud instead of dispatching to it (Tests 4 & 5). |
 | **3.b** Node fails during a snapshot | ✅ Pass | Mid-flight interrupt triggers `finally`→`/fail`, releasing the backup cursor (Test 6). |
 | **3.c** Node fails during a restore | ✅ Pass | STEP 0 pre-flight aborts before destructive steps; sequential overwrite aborts on a per-volume failure (Test 7). |
-| **4.a** Preferred oplog node (+ when a node is added) | ✅ Pass | Selection validated; **add-node reselection confirmed live** — the snapshot opened shard_2's backup cursor on the newly-added `aen-mongo-04:27022`. |
+| **4.a** Preferred oplog node (+ when a node is added) | ✅ Pass (selection) / 🟡 add-node | Tailer registers one `preferredOplogNodes` entry per RS, reselected every run; snapshot node-selection already adapts to a new member (opened a cursor on the newly-added `aen-mongo-04:27022`). The explicit *add-node → confirm oplog-preferred reselection* hasn't been run as its own test. |
 | **4.b** Valid restore-target endpoint before restore | ⚠️ Design difference | Validates at the **storage layer** (snapshot present on every array, per-member, size match) rather than OM's `POST /clusters` endpoint (which 400'd and is redundant for in-place self-restore). |
 | **4.c** No oplog gaps before PIT restore | ✅ Pass | `invoke-oplog-replay` refuses on `gap-*.json` markers (`--allow-gaps` overrides). Capture-lag (~2–3 min) documented as expected, not a gap. |
 | **4.d** Status polling during snapshot/restore | ✅ Pass | Polls `snapshot`/`oplogSnapshot`/cluster state every run. |
 | **4.e** Fail requests on bad state | ✅ Pass (snapshot) / ⚠️ oplog | Snapshot `/fail` fires on interrupt/failure; OM treats `/fail` as a no-op on a stuck `PENDING` *oplog* job (pre-check avoids creating that state). |
 | **Add node** — aen-mongo-04 as 4th member of all 3 shards | ✅ Pass | Added via OM `automationConfig` API (v8→v9), clean initial sync. `initialize-protection-groups` auto-created the PG on a **new fleet array** (`sn1-c60-e12-16`) for -04's volume. Snapshot+restore (`om-20260609-075555`): 4 volumes / 4 arrays, **drift 0**. |
 | **2.A.c** Add a shard, then restore | ✅ Pass | Added `aen-shard_3` (single-member on -04:27023) via API. Two gotchas surfaced & cleared: (1) the new port had to be opened in the host **firewall** (mongos couldn't reach 27023 → `addShard` hung), (2) a newly-added shard has **no backup job** yet → first full snapshot `500 JOB_NOT_FOUND` until OM's backup daemon caught up. Snapshot+restore (`om-20260609-085646`): 4 shards, **drift 0**. |
-| **2.A.d** Remove a shard, then restore | ✅ Pass | Snapshot+restore on the post-removal 3-shard topology: `om-20260610-152019` → restore → mongos up, 3 shards, 3 primaries, **drift 0** (loadtest 39600 / payload 20000). Backup was first recovered (see below) — `removeShard`'s `topologyAbort` had wedged it pre-`STARTED`. | `removeShard` drained the shard to 0 chunks; removed from `automationConfig` → cluster healthy 3-shard, `listShards`=3. Post-removal backup wedged: the `removeShard` fired a **`topologyAbort`** (`backupjobs.clusters.lastAbort`) that cancelled the in-flight backup and left it **stuck below `STARTED`** — shards `synced:false`, so `WTCheckpointResource` returns **"no running members"** → `$backupCursor` never opens → snapshots stall `PENDING`. Catch-22: can't `unmanage` (`stopCluster` needs `STARTED`) or `manage` (`startCluster` needs `INACTIVE`); API + UI disable/enable both hit the `STARTED` wall. **RECOVERED 2026-06-10 (no MongoDB code change):** cleaned stale refs → **force-unmanage** (backed up + deleted the active `backupjobs.clusters`/`jobs`/`thirdparty.jobs` docs, kept history) → **`mongodb-mms` restart** (the blocking lifecycle state is *in-memory*, not persisted) → **`manage`** (fresh rebuild, topology validated, `ACTIVE`) → snapshot `om-20260610-145351` (`6a29b201`) **READY→FINISHED**, FA snaps on 4 arrays. Backup is functional again; see issue #1 (closed). **Next: exercise the restore + verify drift 0.** Cluster data + automation healthy throughout. |
-| **2.A.g / 2.A.h** Config conversion (embedded ↔ dedicated config server) | ✅ Pass (both directions) | Done **in-place** on the existing config RS (no new node needed; `transitionToDedicatedConfigServer` / `transitionFromDedicatedConfigServer` change a *logical* state, not hardware — config-00 left staged). **2.A.g embedded→dedicated:** `transitionToDedicatedConfigServer` drained the config shard's chunks to shard_1/shard_2 + `movePrimary testdb→aen-shard_1` (the command pauses for an explicit `movePrimary` of each DB whose primary is the config shard) → `completed`, config shard at **0 user chunks**; backup stayed `ACTIVE`; snapshot `om-20260610-155312` → restore → **drift 0**. **2.A.h dedicated→embedded:** `transitionFromDedicatedConfigServer` → config shard data-bearing again; this re-embed **wedged backup** (cursor "waiting for other shards/configs to load", `lastAbort=null` — milder than the shard-removal wedge), **cleared by a single `mongodb-mms` restart** (no force-unmanage needed); snapshot `om-20260610-161057` → restore → **drift 0**. No data lost across either conversion (39600/20000 throughout). |
+| **2.A.d** Remove a shard, then restore | ✅ Pass | Snapshot+restore on the post-removal 3-shard topology: `om-20260610-152019` → restore → mongos up, 3 shards, 3 primaries, **drift 0** (loadtest 39600 / payload 20000). Backup was first recovered (see below) — `removeShard`'s `topologyAbort` had wedged it pre-`STARTED`. | `removeShard` drained the shard to 0 chunks; removed from `automationConfig` → cluster healthy 3-shard, `listShards`=3. Post-removal backup wedged: the `removeShard` fired a **`topologyAbort`** (`backupjobs.clusters.lastAbort`) that cancelled the in-flight backup and left it **stuck below `STARTED`** — shards `synced:false`, so `WTCheckpointResource` returns **"no running members"** → `$backupCursor` never opens → snapshots stall `PENDING`. Catch-22: can't `unmanage` (`stopCluster` needs `STARTED`) or `manage` (`startCluster` needs `INACTIVE`); API + UI disable/enable both hit the `STARTED` wall. **RECOVERED 2026-06-10 (no MongoDB code change):** cleaned stale refs → **force-unmanage** (backed up + deleted the active `backupjobs.clusters`/`jobs`/`thirdparty.jobs` docs, kept history) → **`mongodb-mms` restart** (the blocking lifecycle state is *in-memory*, not persisted) → **`manage`** (fresh rebuild, topology validated, `ACTIVE`) → snapshot `om-20260610-145351` (`6a29b201`) **READY→FINISHED**, FA snaps on 4 arrays. Backup is functional again; see issue #1 (closed). Restore was subsequently exercised on the 3-shard topology → **drift 0** (`om-20260610-152019`, per the outcome above). Cluster data + automation healthy throughout. |
+| **2.A.g / 2.A.h** Config conversion (embedded ↔ dedicated config server) | ✅ Pass (both directions) | Done **in-place** on the existing config RS (no new node needed; `transitionToDedicatedConfigServer` / `transitionFromDedicatedConfigServer` change a *logical* state, not hardware — config-00 left staged). **2.A.h embedded→dedicated:** `transitionToDedicatedConfigServer` drained the config shard's chunks to shard_1/shard_2 + `movePrimary testdb→aen-shard_1` (the command pauses for an explicit `movePrimary` of each DB whose primary is the config shard) → `completed`, config shard at **0 user chunks**; backup stayed `ACTIVE`; snapshot `om-20260610-155312` → restore → **drift 0**. **2.A.g dedicated→embedded:** `transitionFromDedicatedConfigServer` → config shard data-bearing again; this re-embed **wedged backup** (cursor "waiting for other shards/configs to load", `lastAbort=null` — milder than the shard-removal wedge), **cleared by a single `mongodb-mms` restart** (no force-unmanage needed); snapshot `om-20260610-161057` → restore → **drift 0**. No data lost across either conversion (39600/20000 throughout). |
+| **1.A.a** RS self-restore — **standalone replica set** | ✅ Pass | **`aen-rs-00`** (multi-deployment, `--deployment aen-rs-00`): snapshot `om-20260611-124009` → **mutate** (`testdb.loadtest/payload`→0/0 + add `testdb.sentinel`) → restore → **5000/5000, `sentinel` GONE, drift 0** — a true point-in-time rollback (not a no-op). Topology-agnostic node selection + the new RS STEP 7 branch (verify writable primary, no `listShards`). |
+| **Restructure** → dedicated config server, then backup recovery | ✅ Pass | `aen-cluster` migrated to a **dedicated config server** (`aen-mongo-config-00`) + 3 data shards (`aen-shard_1/2/3`). The topology change wedged OM third-party backup (`THIRD_PARTY_DISCOVERY_ERROR`; API `unmanage` accepted but stuck `TERMINATING` through 2 restarts); recovered via **orphan cleanup → force-unmanage → `mongodb-mms` restart → `manage`**, plus adding config-00's data volume to `aen-cluster-pg` → snapshot `om-20260611-093257` **FINISHED**. Filed as **issue #2** for MongoDB. |
 
 **Cross-cutting findings (this effort):**
 - **Oplog capture lag (~2–3 min):** the recoverable PIT point trails the live oplog until segments are captured; PIT tests must drain past the target before relying on it (not a defect — replay applies 100% of captured segments, 0 gaps).
 - **New shard/member on a new port** must have that port opened in the node firewall, and a newly-added shard needs its **backup job initialized** (transient `JOB_NOT_FOUND`) before the first full snapshot.
 - **Shard removal can wedge OM third-party backup — and how to recover it (significant finding):** `removeShard` fires a **`topologyAbort`** that cancels the in-flight backup and leaves it **stuck below the `STARTED` lifecycle state** (shards `synced:false`, `workingOn:false`). The agents then get **"no running members for group"** from `WTCheckpointResource`, so the `$backupCursor` is never opened and every snapshot stalls `PENDING`. It's a catch-22: `unmanage` needs `STARTED`, `manage` needs `INACTIVE`, and the OM UI disable/enable hits the same wall (`THIRD_PARTY_UNMANAGE_BACKUP_REQUEST_FAILED` / `not in STARTED state`). Diagnosed from OM's own logs (`mms0.log`/`daemon.log`). **Recovery (verified, no MongoDB code change):** (1) clean stale node refs in `backupjobs.thirdparty.jobs`/`jobs` + clear `backupjobs.clusters.lastAbort`; (2) **force-unmanage** — back up then delete the active config docs (`backupjobs.clusters`, per-shard `backupjobs.jobs`, `backupjobs.thirdparty.jobs`), keeping history; (3) **restart `mongodb-mms`** — the blocking lifecycle state is *in-memory*, not in any appdb collection, so the restart is what makes `manage` work; (4) `POST /manage` rebuilds fresh + validates topology (`ACTIVE`); (5) snapshot → `READY→FINISHED`. Cluster data + automation healthy throughout; only OM's backup metadata is involved. **2.A.d backup is recovered; 2.A.d restore + 2.A.g/h config conversion are now unblocked.**
 - **Tool hardening:** `new-mongo-snapshot` STEP 0 now tolerates a failed pre-check GET of the prior snapshot (stale after a topology change) instead of crashing.
+- **Multi-deployment support (2026-06-11):** the tool now backs up **both** a sharded cluster and a standalone replica set from one `.env` (`--deployment`, `TOPOLOGY=sharded|replicaset`). Node selection was already OM-`replicaSets`-driven (not `listShards`); added `replicaset` branches to the two remaining `listShards` callers — restore STEP 7 (verify the single RS's writable primary) and the snapshot PIT anchors — leaving the certified sharded paths byte-for-byte unchanged (13/13 unit tests pass). `initialize-protection-groups` now also writes the OM-discovered node list back into the deployment's `CLUSTER_NODES` so the OM-unreachable fallback stays current; the FA client gained `patch_protection_groups` (PG rename). The PG was renamed `aen-mongodb-pg`→`aen-cluster-pg` (Purity cascaded all 81 snapshots).
+- **Enabling third-party backup on an RS:** use `POST backup/third_party/.../clusters/{id}/manage` (FA controls snapshots → **no OM snapshot store needed**). The standard managed-backup path (`PATCH backupConfigs statusName=STARTED`) is wrong for third-party and 409s `Could not find available Snapshot Store`.
+- **Dedicated-config-server migration also wedges backup (issue #2, the discovery-wedge variant):** after migrating to a dedicated config server + re-adding a shard, the third-party backup wedged with `THIRD_PARTY_DISCOVERY_ERROR` ("inconsistent data from Monitoring & Automation"). New nuances vs the shard-removal wedge: (1) leftover **old config-RS mongods** (`:27020`) must be stopped and their **stale OM monitoring host entries deleted** (`DELETE …/hosts/{id}`) — this made API `unmanage` *accepted* (previously rejected), though it then stuck in `TERMINATING` through two `mongodb-mms` restarts, so the **appdb force-unmanage was still required**; (2) the **dedicated config server's data volume** (on a different array) must be added to the backup PG via `initialize-protection-groups` or the snapshot fails node→volume mapping. Recovery then succeeded end-to-end (`om-20260611-093257` FINISHED). `snapshotSchedule` returning HTTP 500 is a pre-existing OM quirk for third-party configs, **not** a wedge signal.
+- **Restore-fidelity proof method:** a same-count drift check (`got ∈ [preSnap, postSnap]`) passes even for a no-op restore. The RS self-restore (1.A.1.a) was therefore proven by forcing **divergence first** (delete all docs → 0/0, add a `sentinel` collection), then confirming the restore reverts to the snapshot point-in-time (5000/5000, **sentinel gone**). Recommend applying this mutate-then-restore method to the sharded self-restore rows too.
+- **Per-shard restore verification (added 2026-06-11):** to satisfy the checklist's *"verify the shards contain the correct data"* explicitly (not just via the mongos-routed total), `restore-mongo-snapshot` STEP 8 now — for `sharded` topology — enumerates shards via `listShards`, connects to each shard's RS directly, counts the verify collections per-shard, prints the distribution, and asserts the per-shard totals account for the mongos aggregate (`sum ≥ routed total`; a shard short of data **fails** the restore, orphaned docs inflate-only and are noted). Replica-set deployments skip it (the single RS *is* the aggregate).
 
 ## Status legend
 - ✅ **Validated** — exercised live against `aen-cluster` (see referenced doc / results).
@@ -44,23 +51,38 @@ per-item status and rationale follow in the sections below.
 - ❌ **Not applicable** — out of scope for this implementation (rationale given).
 
 ## Scope of this implementation (read first — it determines applicability)
-- **Sharded clusters only.** The tooling discovers topology via `mongos`/`listShards` and the Ops Manager cluster
-  API. A **standalone replica set** (no `mongos`) is **out of scope** → all *Replica Set Tests* are ❌.
+- **Sharded *and* standalone replica-set clusters (multi-deployment).** As of 2026-06-11 the tooling is
+  configured per *deployment* in a **single `.env`** (shared infra + `<NAME>__` key overrides), selected with
+  `--deployment <name>` and a `TOPOLOGY` of `sharded` or `replicaset`. Topology discovery is **Ops-Manager-driven**
+  (the third-party cluster detail's `replicaSets`), so snapshot node-selection is topology-agnostic; the only
+  `mongos`/`listShards` uses (restore-stabilization, PIT anchors) now branch on `TOPOLOGY` — `replicaset` verifies
+  the single RS's writable primary directly. → **Replica Set Tests are now in scope** (see §1). The proven
+  sharded `listShards` paths are unchanged; the 13-test unit suite still passes.
 - **In-place self-restore only.** `restore-mongo-snapshot` overwrites the *source* cluster's own FlashArray
   volumes from their snapshots (a CoW pointer swap), then WiredTiger recovers. **Restoring to a *different*
   cluster/replica set is not implemented** → "Restore … to different …" items are ❌.
 - **Full snapshots only.** FlashArray protection-group snapshots are always full (CoW); `new-mongo-snapshot`
   takes full snapshots and stores no incremental chain (`srcBackupName` is never used). **All *Incremental Backup
   Tests* are ❌** (not a concept for storage-snapshot backup).
-- **Topology:** validated on a 3-shard cluster with an **embedded config shard** (`config`/`aen-shard_0`,
-  `aen-shard_1`, `aen-shard_2`), one FlashArray data volume per node in a Fusion fleet, driven by the hybrid
-  gateway-routed FA client.
+- **Topology:** validated on (a) **`aen-cluster`** — restructured to a **dedicated config server**
+  (`aen-shard_0` on `aen-mongo-config-00`) + **3 data shards** (`aen-shard_1/2/3` on aen-mongo-01/02/03); and
+  (b) **`aen-rs-00`** — a **standalone 3-member replica set** (aen-mongo-05/06/07). One FlashArray data volume per
+  node in a Fusion fleet, driven by the hybrid gateway-routed FA client. Backup protection groups follow a
+  `<cluster-name>-pg` convention (`aen-cluster-pg`, `aen-rs-00-pg`).
 
 ## Data-insertion & verification methodology (per the checklist)
 - **Non-PIT:** insert **data set A** → `new-mongo-snapshot` → insert **data set B** → restore → verify **A and
   only A** (B is correctly lost). Realized here via `start-insert-load` (bulk) and/or `mongos` (marker docs); the
   snapshot embeds `mongo:preSnap`/`mongo:postSnap` count baselines into the FA snapshot tags and STEP 8 of the
-  restore asserts the post-restore count falls in `[preSnap, postSnap]` (the consistency window).
+  restore asserts the post-restore count falls in `[preSnap, postSnap]` (the consistency window). **For sharded
+  clusters, STEP 8 also verifies the shards themselves hold the data** (the checklist's *"verify the shards
+  contain the correct data"*): it enumerates shards via `listShards`, connects to each shard's RS directly,
+  counts the verify collections per-shard, prints the distribution, and asserts the per-shard totals account for
+  the mongos aggregate (`sum ≥ routed total` — a shard *short* of data fails the restore; a direct shard count
+  can include orphaned docs, which only inflate the sum and are noted, not failed). The strongest **"only A"**
+  proof is the *mutate-then-restore* method: between snapshot and restore, delete/alter the data and add a
+  sentinel collection, then confirm the restore reverts to the snapshot point-in-time and the sentinel is gone
+  (done for the RS self-restore, 1.A.1.a; recommended for the sharded rows).
 - **PIT:** `start-oplog-tailer` → insert **A** → `new-mongo-snapshot` (T1) → insert **B** → (tailer keeps
   capturing) → insert **C** → `stop-oplog-tailer` (writes the T2 mark) → restore to T1 → `invoke-oplog-replay`
   to a target timestamp **after B** → verify **A+B and only A+B** (C beyond the target is excluded).
@@ -76,10 +98,21 @@ mongos() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@${MONGOS_HOST}" "${MONGOSH_PATH} --
 
 ---
 
-## 1. Replica Set Tests — ❌ Not applicable
-This implementation targets **sharded** clusters (requires `mongos`/`listShards`). A standalone replica set is out
-of scope, so 1.A/1.B (self / different-RS / arbiter, full & incremental, non-PIT & PIT) are all **❌ N/A**. (A
-single-shard sharded cluster would be covered by the Sharded tests below, not these.)
+## 1. Replica Set Tests — ✅ In scope (multi-deployment, 2026-06-11)
+Validated against **`aen-rs-00`** — a standalone 3-member replica set (aen-mongo-05/06/07). OM third-party backup
+was enabled via the `backup/third_party/.../manage` endpoint (**no OM snapshot store required** — the FlashArray
+holds the snapshots; the standard `backupConfigs statusName=STARTED` path is wrong here and 409s "no available
+Snapshot Store"). Run any command with `--deployment aen-rs-00`.
+
+| # | Official checklist item | Applicability | How / Status |
+|---|---|---|---|
+| 1.A.1.a | **Restore Replica Set to self** (full snapshot) | ✅ **Validated** | Snapshot `aen-rs-00-pg.om-20260611-124009` → **true point-in-time fidelity proof**: baseline `testdb.loadtest/payload=5000` → **mutate** (`deleteMany`→0/0 + add `testdb.sentinel`) → restore → post-restore **5000/5000 and `testdb.sentinel` GONE** (B reverted, A and only A present, **drift 0**). STEP 1 selected an RS secondary (no `listShards`); STEP 7 used the `replicaset` branch ("primary elected: aen-mongo-06:27017"); STEP 8 drift 0. |
+| 1.A.1.b | Restore Replica Set to **different** Replica Set | ❌ N/A | In-place self-restore only (no cross-cluster restore). |
+| 1.A.2.a | **Incremental** Restore RS to different RS | ❌ N/A | FlashArray snapshots are always full; no incremental chain. |
+| 1.B.1.a | **PIT Restore Replica Set to self** | 🟡 Supported, **pending RS PIT branch** | Snapshot + self-restore proven; PIT additionally needs the `replicaset` branch in `start-oplog-tailer` + `invoke-oplog-replay` (both still resolve shards via `listShards`). Not yet run. |
+| 1.B.1.b | PIT Restore RS to **different** RS | ❌ N/A | In-place self-restore only. |
+| 1.B.1.c | PIT Restore RS to **different** RS **with Arbiter** | ❌ N/A | To-different is out of scope. *(Arbiter handling itself is supported: arbiters hold no data and are never `snapshotable`, so node selection skips them — a self-restore of an RS that contains an arbiter works fine; only the to-different target makes this item N/A.)* |
+| 1.B.2.a | **Incremental** PIT Restore RS to different RS | ❌ N/A | Full snapshots only. |
 
 ---
 
@@ -89,14 +122,14 @@ single-shard sharded cluster would be covered by the Sharded tests below, not th
 
 | # | Test | Applicability | How / Status |
 |---|---|---|---|
-| a | Self Restore Sharded Cluster | ✅ Supported | In-place self-restore. Validated on the embedded-config cluster (see 2.A.e). A dedicated-config cluster would run identically. |
+| a | Self Restore Sharded Cluster | ✅ Supported | In-place self-restore. Validated on the embedded-config cluster (see 2.A.e). `aen-cluster` has since been restructured to a **dedicated config server** (`aen-mongo-config-00`) + 3 shards and **snapshots cleanly there** (`om-20260611-093257` FINISHED, incl. config-00's volume in the PG); a full self-restore on the dedicated-config topology was not separately re-run this session (restore mechanics unchanged from 2.A.e). |
 | b | Restore Sharded Cluster *(to different)* | ❌ N/A | In-place self-restore only — no cross-cluster restore. |
-| c | Add a shard, then restore | ⚙️ Supported w/ procedure | Add the shard, then **`initialize-protection-groups`** so the new node's data volume is added to the PG (the snapshot's STEP 0 gate hard-fails if any discovered data volume isn't a PG member). Topology is re-discovered every run (`get_cluster_nodes` + SCSI-serial map), so the new shard is picked up automatically. **🟡 not yet tested.** |
-| d | Remove a shard, then restore | ⚙️ Supported w/ procedure | After removing the shard, optionally `initialize-protection-groups --prune` to drop the orphaned volume. Runtime discovery reflects the smaller topology; restore targets only the discovered (current) volumes via the `mongo:volumes` tag. **🟡 not yet tested.** |
+| c | Add a shard, then restore | ✅ **Validated** | Added `aen-shard_3` via the OM API, then `initialize-protection-groups` added the new node's volume to the PG (STEP 0 hard-fails if any discovered volume isn't a PG member; topology re-discovered every run). Two gotchas cleared: new-port firewall, and transient `JOB_NOT_FOUND` until the new shard's backup job initialized. Snapshot+restore `om-20260609-085646`: 4 shards, **drift 0**. |
+| d | Remove a shard, then restore | ✅ **Validated** | `removeShard` → 3-shard topology; `initialize-protection-groups --prune` drops the orphaned volume; restore targets only the current volumes via the `mongo:volumes` tag. The removal wedged OM backup (`topologyAbort`) — recovered via force-unmanage → `mongodb-mms` restart → `manage` (cross-cutting findings; issue #1). Snapshot+restore `om-20260610-152019`: 3 shards, 3 primaries, **drift 0**. |
 | e | **Self Restore Sharded Cluster with Embedded Config** | ✅ **Validated** | This is `aen-cluster`. **Test 1** (no load) and **Test 2** (under load) — see [Test-SnapshotRestore.md](Test-SnapshotRestore.md); 2026-06-05 results: Test 1 drift 0, Test 2 post-restore within `[preSnap, postSnap]`. |
 | f | Restore Sharded Cluster w/ Embedded Config *(to different)* | ❌ N/A | In-place self-restore only. |
-| g | Convert Dedicated→Embedded config, then restore | ⚙️ Supported w/ procedure | Discovery keys per-shard artifacts by canonical shard id (`config` for the embedded config shard); after the conversion, re-run `initialize-protection-groups` and snapshot. **🟡 not yet tested.** |
-| h | Convert Embedded→Dedicated config, then restore | ⚙️ Supported w/ procedure | Same as (g) in reverse. **🟡 not yet tested.** |
+| g | Convert **Dedicated→Embedded** config, then restore | ✅ **Validated** | `transitionFromDedicatedConfigServer` → config shard data-bearing again; mild backup wedge ("waiting for other shards/configs to load", `lastAbort=null`) **cleared by a single `mongodb-mms` restart** (no force-unmanage). Discovery keys per-shard artifacts by canonical shard id (`config`). Snapshot+restore `om-20260610-161057`: **drift 0**. |
+| h | Convert **Embedded→Dedicated** config, then restore | ✅ **Validated** | `transitionToDedicatedConfigServer` (drains config-shard chunks + `movePrimary`); backup stayed `ACTIVE`. Snapshot+restore `om-20260610-155312`: **drift 0**. *(`aen-cluster` was later migrated to a fully **dedicated** config server on `aen-mongo-config-00` — see the Restructure row in the Test Summary.)* |
 
 ### 2.A Full Snapshot Restore — Incremental — ❌ Not applicable
 2.A.2.a/b (incremental, with/without embedded config): **❌ N/A** — FlashArray snapshots are always full;
@@ -150,14 +183,21 @@ single-shard sharded cluster would be covered by the Sharded tests below, not th
 | Restore under load / consistency window | ✅ Validated |
 | Failover: node-down pre-flight (3.a), fail-during-snapshot (3.b), fail-during-restore (3.c) | ✅ Validated (3.a solved this session) |
 | Verification: status polling (4.d), fail-on-bad-state (4.e snapshot) | ✅ Validated |
-| Add/remove shard, config conversion, arbiter | 🟡 Supported, not yet exercised |
+| **Replica-set self-restore (1.A.a)** | ✅ **Validated** on `aen-rs-00` — true point-in-time fidelity proof (mutate→restore→`sentinel` gone, drift 0) |
+| **Replica-set PIT (1.B.a)** | 🟡 Supported; needs the `replicaset` branch in `start-oplog-tailer`/`invoke-oplog-replay` before running |
+| **Dedicated config-server migration + backup recovery** | ✅ Validated — restructured `aen-cluster` to dedicated config-00; recovered the post-migration backup wedge (issue #2) → snapshot FINISHED |
+| Add/remove shard, config conversion (in-place), arbiter | 🟡/✅ — add/remove shard & in-place config conversion validated earlier; arbiter not exercised |
 | Valid-restore-target endpoint (4.b) | ⚠️ Storage-layer validation instead of the OM endpoint |
 | Auto gap-check before replay (4.c) | ✅ Enforced — replay refuses on gap markers (`--allow-gaps` overrides) |
-| Replica-set tests; restore-to-different; all incremental | ❌ Out of scope (sharded, in-place self-restore, full-only) |
+| Restore-to-different; all incremental | ❌ Out of scope (in-place self-restore, full-only) |
 
-**Cert-readiness read:** the in-scope, applicable scenarios that have been exercised all pass — including full
-forward PIT recovery on a current stream (2.B.e, `unrecoveredTail==0`) and node-change continuity (2.B.c, 0 gaps);
-the remaining applicable items (add/remove shard, config conversion, arbiter, and the forced-node-change +
-forward-advance *combined* pass) are supported by design but not yet run, and two verification items (4.b OM
-valid-target endpoint, 4.c auto gap-check) are **conscious design differences** that should be confirmed against
-the certifier's exact requirements before submission.
+**Cert-readiness read:** the in-scope, applicable scenarios that have been exercised all pass — sharded
+self-restore (2.A.e), full forward PIT recovery on a current stream (2.B.e, `unrecoveredTail==0`), node-change
+continuity (2.B.c, 0 gaps), and now **replica-set self-restore** (1.A.a, true point-in-time fidelity proof on
+`aen-rs-00`). The tool is now **multi-deployment** (sharded + standalone RS from one `.env`), and the OM
+third-party backup wedge that follows topology changes (shard removal *and* dedicated-config-server migration) is
+recoverable by a documented operator procedure (force-unmanage → `mongodb-mms` restart → `manage`; filed as
+issues #1/#2). Remaining applicable items: **replica-set PIT** (1.B.a — needs the `replicaset` branch added to the
+tailer/replay before running), arbiter, and the forced-node-change + forward-advance *combined* pass. Two
+verification items (4.b OM valid-target endpoint, 4.c auto gap-check) are **conscious design differences** to
+confirm against the certifier's exact requirements before submission.

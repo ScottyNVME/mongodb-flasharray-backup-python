@@ -774,6 +774,94 @@ def _run(
                     f"  {verify_database}.payload  document count: {payload_count}", fg=config.CYAN
                 )
 
+                # Per-shard verification (sharded only). The certification checklist requires confirming the
+                # *shards themselves* hold the data, not just the mongos-routed total. Connect to each shard's
+                # RS directly, count the verify collections, and assert the per-shard sums account for the
+                # mongos aggregate (>=, since a direct shard count can include orphaned docs post-migration).
+                # A replica set has a single RS, so the aggregate above already is its total — no per-shard step.
+                if config.CFG.Topology != "replicaset":
+                    per_shard_js = (
+                        "const shards = db.adminCommand({listShards:1}).shards;\n"
+                        "for (const s of shards) {\n"
+                        "    const parts = s.host.split('/');\n"
+                        "    const uri = 'mongodb://' + parts[1] + '/?replicaSet=' + parts[0];\n"
+                        "    let lt = -1, pl = -1;\n"
+                        "    try {\n"
+                        f"        const d = new Mongo(uri).getDB('{verify_database}');\n"
+                        "        lt = d.loadtest.countDocuments();\n"
+                        "        pl = d.payload.countDocuments();\n"
+                        "    } catch (e) { /* unreachable shard -> -1 */ }\n"
+                        "    print(s._id + ' ' + lt + ' ' + pl);\n"
+                        "}\n"
+                    )
+                    ps_js = f"/tmp/mongo_pershard_{snapshot_tag}.js"
+                    subprocess.run(
+                        ["ssh", *config.SSH_OPTS, f"{config.CFG.SshUser}@{config.CFG.MongosHost}", f"cat > {ps_js}"],
+                        input=per_shard_js, capture_output=True, text=True,
+                    )
+                    ps_remote = (
+                        f"{config.CFG.MongoshPath} --quiet --file {ps_js} "
+                        f"mongodb://{config.CFG.MongosHost}:{config.CFG.MongosPort} 2>/dev/null"
+                    )
+                    ps_proc = subprocess.run(
+                        ["ssh", *config.SSH_OPTS, f"{config.CFG.SshUser}@{config.CFG.MongosHost}", ps_remote],
+                        capture_output=True, text=True,
+                    )
+                    config.write_host("  Per-shard verification (each shard's own data):", fg=config.CYAN)
+                    sum_lt = sum_pl = 0
+                    shard_rows = 0
+                    empty_shards: list[str] = []
+                    unreachable: list[str] = []
+                    for line in (ps_proc.stdout or "").splitlines():
+                        cols = line.split()
+                        if len(cols) != 3 or not re.match(r"^-?\d+$", cols[1]) or not re.match(r"^-?\d+$", cols[2]):
+                            continue
+                        sid, lt_n, pl_n = cols[0], int(cols[1]), int(cols[2])
+                        shard_rows += 1
+                        if lt_n < 0 or pl_n < 0:
+                            unreachable.append(sid)
+                            config.write_host(f"    {sid}: UNREACHABLE", fg=config.YELLOW)
+                            continue
+                        sum_lt += lt_n
+                        sum_pl += pl_n
+                        if lt_n == 0 and pl_n == 0:
+                            empty_shards.append(sid)
+                        config.write_host(
+                            f"    {sid}: {verify_database}.loadtest={lt_n} payload={pl_n}", fg=config.GREEN
+                        )
+                    if shard_rows == 0:
+                        config.write_host(
+                            "    WARNING: listShards returned no shards - skipping per-shard check.",
+                            fg=config.YELLOW,
+                        )
+                    elif unreachable:
+                        raise RuntimeError(
+                            f"Per-shard verification FAILED: shard(s) unreachable: {', '.join(unreachable)}"
+                        )
+                    elif sum_lt < load_test_count or sum_pl < payload_count:
+                        raise RuntimeError(
+                            f"Per-shard verification FAILED: per-shard totals (loadtest={sum_lt}, "
+                            f"payload={sum_pl}) are LESS than the mongos aggregate (loadtest={load_test_count}, "
+                            f"payload={payload_count}) - a shard is missing data."
+                        )
+                    else:
+                        config.write_host(
+                            f"  Per-shard totals account for the mongos aggregate across {shard_rows} shard(s) "
+                            f"(loadtest {sum_lt}>={load_test_count}, payload {sum_pl}>={payload_count}).",
+                            fg=config.GREEN,
+                        )
+                        if sum_lt > load_test_count or sum_pl > payload_count:
+                            config.write_host(
+                                "    NOTE: per-shard sum exceeds the routed total - likely orphaned documents "
+                                "(benign; mongos filters them).",
+                                fg=config.DARK_YELLOW,
+                            )
+                        if empty_shards:
+                            config.write_host(
+                                f"    NOTE: shard(s) with 0 docs in both collections: {', '.join(empty_shards)}.",
+                                fg=config.DARK_YELLOW,
+                            )
+
                 if baseline:
                     # Look up a baseline count from a tag container; returns None if missing, else the count.
                     def get_baseline_count(container, db: str, coll: str):
