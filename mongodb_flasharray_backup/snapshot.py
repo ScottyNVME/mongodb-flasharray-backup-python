@@ -89,9 +89,14 @@ def _run(
         callback=_validate_snapshot_tag,
         help="Optional: override the auto-generated snapshot tag (om-YYYYMMDD-HHmmss).",
     ),
+    deployment: str = typer.Option(
+        None,
+        "--deployment",
+        help="Deployment name to back up (selects '<NAME>__' keys in .env). Omit to use the flat keys.",
+    ),
 ) -> None:
     # Load .env FIRST (raises if missing) so all configuration is available before any work begins.
-    config.load_config()
+    config.load_config(deployment=deployment)
     cfg = config.CFG
 
     # region --- Configuration ---
@@ -398,14 +403,27 @@ def _run(
                     fg=config.CYAN,
                 )
                 try:
-                    # Key by shard _id (canonical mongos identifier returned by listShards).
-                    ShardJson = config.invoke_mongosh_js(
-                        ssh_target=cfg.MongosHost,
-                        uri=f"mongodb://{cfg.MongosHost}:{cfg.MongosPort}",
-                        js=config.LIST_SHARDS_JS,
-                        context="listShards via mongos",
-                    )
-                    Shards = json.loads(ShardJson)
+                    if cfg.Topology == "replicaset":
+                        # No mongos/listShards: the single replica set is the only "shard". Resolve its
+                        # set name from a member; the loop below anchors off its primary's oplog top.
+                        SetNameRaw = config.invoke_mongosh_js(
+                            ssh_target=cfg.MongosHost,
+                            uri=f"'mongodb://{cfg.MongosHost}:{cfg.MongosPort}/?directConnection=true'",
+                            js='var h=db.adminCommand({hello:1}); print(h.setName || "");',
+                            context=f"replica-set name via {cfg.MongosHost}:{cfg.MongosPort}",
+                        )
+                        SetLines = [ln.strip() for ln in (SetNameRaw or "").splitlines() if ln.strip()]
+                        SetName = SetLines[-1] if SetLines else "replicaset"
+                        Shards = [{"shardId": SetName, "host": f"{cfg.MongosHost}:{cfg.MongosPort}"}]
+                    else:
+                        # Key by shard _id (canonical mongos identifier returned by listShards).
+                        ShardJson = config.invoke_mongosh_js(
+                            ssh_target=cfg.MongosHost,
+                            uri=f"mongodb://{cfg.MongosHost}:{cfg.MongosPort}",
+                            js=config.LIST_SHARDS_JS,
+                            context="listShards via mongos",
+                        )
+                        Shards = json.loads(ShardJson)
 
                     Anchors: dict = {}
                     for Sh in Shards:

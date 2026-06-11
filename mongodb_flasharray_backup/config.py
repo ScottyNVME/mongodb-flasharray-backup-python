@@ -77,17 +77,52 @@ def get_env_var(env_vars: dict[str, str], key: str, optional: bool = False) -> O
     raise RuntimeError(f".env is missing required key: {key}")
 
 
+def deployment_env_key(deployment_name: Optional[str], key: str) -> str:
+    """Return the .env key for `key` scoped to a deployment ('<NAME>__<key>'), or the flat key when no
+    deployment is selected. Mirrors the prefix scheme used by load_config()."""
+    if deployment_name:
+        return deployment_name.upper().replace("-", "_") + "__" + key
+    return key
+
+
+def update_env_var(env_file: Path, key: str, value: str) -> bool:
+    """Set key=value in the .env file in place, preserving all other lines and comments. Rewrites the
+    first uncommented assignment to `key` if one exists; otherwise appends `key=value` at the end.
+    Returns True if the value changed (or the key was added), False if it already matched."""
+    lines = env_file.read_text().splitlines()
+    new_line = f"{key}={value}"
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*[^#\s]", line):
+            parts = line.split("=", 1)
+            if len(parts) == 2 and parts[0].strip() == key:
+                if parts[1].strip() == value:
+                    return False
+                lines[i] = new_line
+                env_file.write_text("\n".join(lines) + "\n")
+                return True
+    # Key not present - append it.
+    lines.append(new_line)
+    env_file.write_text("\n".join(lines) + "\n")
+    return True
+
+
 @dataclass
 class Config:
     """Holds every value derived from .env. Populated by load_config()."""
 
     EnvVars: dict[str, str]
+    # Absolute path of the .env file these values were loaded from (for in-place updates).
+    EnvFilePath: Path
     # MongoDB cluster topology
     MongoshPath: str
     MongosHost: str
     MongosPort: int
     SshUser: str
     ClusterNodesFallback: Optional[list[str]]
+    # Topology: 'sharded' (route via mongos/listShards) or 'replicaset' (target the RS directly).
+    Topology: str
+    # Selected deployment name, or None when the flat (single-deployment) keys are used.
+    DeploymentName: Optional[str]
     # MongoDB database tools
     MongoToolsBase: str
     MongodumpPath: str
@@ -126,8 +161,18 @@ def _resolve_env_file(env_path: Optional[os.PathLike | str]) -> Path:
     return Path.cwd() / ".env"
 
 
-def load_config(env_path: Optional[os.PathLike | str] = None) -> Config:
+def load_config(
+    env_path: Optional[os.PathLike | str] = None, deployment: Optional[str] = None
+) -> Config:
     """Load .env and populate CFG.
+
+    A single .env can describe several deployments. Shared infrastructure (FA/OM credentials, SSH user,
+    tool paths) lives in flat keys; deployment-specific keys may be overridden per deployment with a
+    "<NAME>__" prefix (NAME upper-cased, hyphens -> underscores). When no deployment is selected the flat
+    keys are used as-is, so single-deployment .env files keep working unchanged.
+
+    Deployment resolution order: `deployment` arg > MONGO_FA_BACKUP_DEPLOYMENT env > DEFAULT_DEPLOYMENT
+    key in .env > None (flat keys).
 
     Throws if the .env file is missing or a required key is absent.
     """
@@ -142,13 +187,32 @@ def load_config(env_path: Optional[os.PathLike | str] = None) -> Config:
     def g(key: str, optional: bool = False) -> Optional[str]:
         return get_env_var(env_vars, key, optional)
 
+    # --- Deployment selection (single-.env, multi-deployment) ---
+    deployment_name = (
+        deployment
+        or os.environ.get("MONGO_FA_BACKUP_DEPLOYMENT")
+        or env_vars.get("DEFAULT_DEPLOYMENT")
+        or None
+    )
+    dep_prefix = (deployment_name.upper().replace("-", "_") + "__") if deployment_name else ""
+
+    def gd(key: str, optional: bool = False) -> Optional[str]:
+        """Deployment-scoped get: try '<PREFIX>__<key>' first, else fall back to the flat key."""
+        if dep_prefix and (dep_prefix + key) in env_vars:
+            return env_vars[dep_prefix + key]
+        return get_env_var(env_vars, key, optional)
+
     # --- MongoDB cluster topology ---
     mongosh_path = g("MONGOSH_PATH")
-    mongos_host = g("MONGOS_HOST")
-    mongos_port = int(g("MONGOS_PORT"))
+    mongos_host = gd("MONGOS_HOST")
+    mongos_port = int(gd("MONGOS_PORT"))
     ssh_user = g("SSH_USER")
+    # 'sharded' (default, route via mongos/listShards) or 'replicaset' (target the single RS directly).
+    topology = (gd("TOPOLOGY", optional=True) or "sharded").strip().lower()
+    if topology not in ("sharded", "replicaset"):
+        raise RuntimeError(f"TOPOLOGY must be 'sharded' or 'replicaset', got '{topology}'")
     # CLUSTER_NODES is optional - fallback only when Ops Manager is unreachable.
-    cluster_nodes_raw = g("CLUSTER_NODES", optional=True)
+    cluster_nodes_raw = gd("CLUSTER_NODES", optional=True)
     cluster_nodes_fallback = cluster_nodes_raw.split(",") if cluster_nodes_raw else None
 
     # --- MongoDB database tools ---
@@ -166,25 +230,28 @@ def load_config(env_path: Optional[os.PathLike | str] = None) -> Config:
     fa_password = g("FA_PASSWORD", optional=True)
     # FA REST API version to pin (skips version auto-negotiation).
     fa_api_version = g("FA_API_VERSION", optional=True) or "2.51"
-    protection_group_name = g("FA_PROTECTION_GROUP")
-    cluster_name = g("FA_CLUSTER_NAME")
+    protection_group_name = gd("FA_PROTECTION_GROUP")
+    cluster_name = gd("FA_CLUSTER_NAME")
 
     # --- Ops Manager ---
     om_host = g("OM_BASE_URL").rstrip("/")
     om_api_version = g("OM_API_VERSION")
     ops_manager_base_url = f"{om_host}/api/public/{om_api_version}"
     group_id = g("OM_GROUP_ID")
-    cluster_id = g("OM_CLUSTER_ID")
+    cluster_id = gd("OM_CLUSTER_ID")
     om_public_key = g("OM_PUBLIC_KEY")
     om_private_key = g("OM_PRIVATE_KEY")
 
     CFG = Config(
         EnvVars=env_vars,
+        EnvFilePath=env_file,
         MongoshPath=mongosh_path,
         MongosHost=mongos_host,
         MongosPort=mongos_port,
         SshUser=ssh_user,
         ClusterNodesFallback=cluster_nodes_fallback,
+        Topology=topology,
+        DeploymentName=deployment_name,
         MongoToolsBase=mongo_tools_base,
         MongodumpPath=mongodump_path,
         MongorestorePath=mongorestore_path,

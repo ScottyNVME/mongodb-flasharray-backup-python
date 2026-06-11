@@ -277,6 +277,13 @@ class Client:
         return self._routed("POST", "protection-groups", context_names=context_names,
                             params={"names": self._csv(names)})
 
+    def patch_protection_groups(self, names: Optional[list] = None, protection_group: Any = None,
+                                context_names: Optional[list] = None):
+        """Update protection group(s) named `names`. Pass protection_group={'name': '<new>'} to rename.
+        On a rename, Purity also renames the group's existing snapshots to the new prefix."""
+        return self._routed("PATCH", "protection-groups", context_names=context_names,
+                            params={"names": self._csv(names)}, body=protection_group)
+
     def get_protection_groups_volumes(self, group_names: Optional[list] = None,
                                       member_names: Optional[list] = None, context_names: Optional[list] = None):
         return self._routed("GET", "protection-groups/volumes", context_names=context_names,

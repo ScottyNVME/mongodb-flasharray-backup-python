@@ -73,6 +73,24 @@ def _validate_snapshot_tag(value: str) -> str:
     return value
 
 
+def _replicaset_primary(member_host: str, member_port: int) -> str:
+    """Return the replica set's current primary 'host:port' as seen from `member_host` via a
+    directConnection hello(), or '' if none is elected/reachable yet. Used by the STEP 7 replica-set
+    readiness probe instead of the sharded listShards path. Never raises (any failure -> '', i.e.
+    "not ready yet")."""
+    try:
+        raw = config.invoke_mongosh_js(
+            ssh_target=member_host,
+            uri=f"'mongodb://{member_host}:{member_port}/?directConnection=true'",
+            js='var h=db.adminCommand({hello:1}); print(h.primary || "");',
+            context=f"replica-set hello via {member_host}:{member_port}",
+        )
+    except Exception:  # noqa: BLE001 - readiness probe; any error means the RS is not ready yet.
+        return ""
+    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
 def _run(
     snapshot_tag: str = typer.Option(
         ...,
@@ -95,10 +113,15 @@ def _run(
         "--skip-verification",
         help="skip STEP 8 entirely; otherwise STEP 8 is fail-hard on unparseable counts",
     ),
+    deployment: str = typer.Option(
+        None,
+        "--deployment",
+        help="Deployment name to restore (selects '<NAME>__' keys in .env). Omit to use the flat keys.",
+    ),
 ) -> None:
     # Load configuration. Must be FIRST so running without
     # .env throws (but --help still works because typer short-circuits before this).
-    config.load_config()
+    config.load_config(deployment=deployment)
 
     # region --- Configuration ---
     wait_timeout_sec = 600   # Max seconds to wait for cluster to stabilize
@@ -584,6 +607,11 @@ def _run(
             deadline = time.monotonic() + wait_timeout_sec
             ready = False
 
+            # Replica-set deployments have no mongos / config server, so listShards does not apply.
+            # Verify the single RS directly: it is stable once it has elected a writable primary.
+            # The sharded path below is unchanged.
+            rs_mode = config.CFG.Topology == "replicaset"
+
             while not ready:
                 if time.monotonic() > deadline:
                     raise RuntimeError(f"Cluster did not stabilize within {wait_timeout_sec} seconds.")
@@ -593,6 +621,21 @@ def _run(
                     f"  {datetime.now().strftime('%H:%M:%S')}  Checking cluster state...",
                     fg=config.CYAN,
                 )
+
+                if rs_mode:
+                    primary = _replicaset_primary(config.CFG.MongosHost, config.CFG.MongosPort)
+                    if primary:
+                        config.write_host(
+                            f"  {datetime.now().strftime('%H:%M:%S')}  replica set up, "
+                            f"primary elected: {primary}.",
+                            fg=config.GREEN,
+                        )
+                        ready = True
+                    else:
+                        config.write_host(
+                            "    replica set has no writable primary yet...", fg=config.DARK_GRAY
+                        )
+                    continue
 
                 # Ping mongos.
                 ping_remote = (

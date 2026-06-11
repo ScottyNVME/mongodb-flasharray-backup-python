@@ -34,9 +34,14 @@ def _run(
         "--force",
         help="Skip the typed-token confirmation prompt for --prune (destructive)",
     ),
+    deployment: str = typer.Option(
+        None,
+        "--deployment",
+        help="Deployment name to initialize (selects '<NAME>__' keys in .env). Omit to use the flat keys.",
+    ),
 ) -> None:
     # Load env-derived config FIRST.
-    config.load_config()
+    config.load_config(deployment=deployment)
 
     # WhatIf banner.
     if what_if:
@@ -70,6 +75,18 @@ def _run(
     # Discover cluster nodes (Ops Manager first, .env fallback).
     config.write_host("  Discovering cluster nodes...", fg=config.CYAN)
     cluster_nodes = config.get_cluster_nodes()
+
+    # Keep the .env CLUSTER_NODES fallback fresh: persist the discovered node list back to the
+    # deployment-scoped key so a later run still works if Ops Manager is unreachable. No-op when the
+    # list is unchanged (e.g. discovery already fell back to .env).
+    if not what_if and cluster_nodes:
+        nodes_key = config.deployment_env_key(config.CFG.DeploymentName, "CLUSTER_NODES")
+        if config.update_env_var(config.CFG.EnvFilePath, nodes_key, ",".join(cluster_nodes)):
+            config.write_host(
+                f"  Updated {nodes_key} in {config.CFG.EnvFilePath.name} "
+                f"({len(cluster_nodes)} nodes).",
+                fg=config.GREEN,
+            )
 
     # Discover node-to-volume mappings via SCSI serial.
     all_context_names = list(all_arrays)
