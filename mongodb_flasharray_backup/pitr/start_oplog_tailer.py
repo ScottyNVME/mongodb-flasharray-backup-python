@@ -83,9 +83,13 @@ def _run(
         False, "--abort-on-gap",
         help="abort the loop when an oplog gap is detected; default: warn and continue",
     ),
+    deployment: str = typer.Option(
+        None, "--deployment",
+        help="Deployment name to tail (selects '<NAME>__' keys in .env). Omit to use the flat keys.",
+    ),
 ) -> None:
     # Load config first.
-    config.load_config()
+    config.load_config(deployment=deployment)
 
     # Read env-derived values used in this script
     group_id = config.CFG.GroupId

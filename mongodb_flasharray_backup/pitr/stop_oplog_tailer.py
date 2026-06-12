@@ -64,9 +64,13 @@ def _run(
     baseline_collections: List[str] = typer.Option(
         ["loadtest", "payload"], "--baseline-collections"
     ),
+    deployment: str = typer.Option(
+        None, "--deployment",
+        help="Deployment name (selects '<NAME>__' keys in .env). Omit to use the flat keys.",
+    ),
 ) -> None:
     # Load config first so running without .env throws.
-    cfg = config.load_config()
+    cfg = config.load_config(deployment=deployment)
 
     home = Path(os.path.expanduser("~"))
     root = home / "mongo-oplog-stream" / snapshot_tag

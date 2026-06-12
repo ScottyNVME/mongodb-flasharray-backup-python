@@ -98,9 +98,14 @@ def _run(
         "--allow-gaps",
         help="proceed even if oplog gap markers are present (PIT coverage in the gap window is unrecoverable)",
     ),
+    deployment: str = typer.Option(
+        None,
+        "--deployment",
+        help="Deployment name to replay (selects '<NAME>__' keys in .env). Omit to use the flat keys.",
+    ),
 ):
     # Load config FIRST (throws without .env).
-    config.load_config()
+    config.load_config(deployment=deployment)
 
     # Log dir + log file appended to during this run.
     log_dir = Path(os.path.expanduser("~")) / "mongo-oplogreplay-logs"
@@ -170,45 +175,68 @@ def _run(
         )
         config.write_host("  FlashArray connected.", fg=config.GREEN)
 
-        # Discover current shard primaries (post-restore).
-        shard_json = config.invoke_mongosh_js(
-            ssh_target=config.CFG.MongosHost,
-            uri=f"mongodb://{config.CFG.MongosHost}:{config.CFG.MongosPort}",
-            js=config.LIST_SHARDS_JS,
-            context="listShards via mongos",
-        )
-        shards = json.loads(shard_json)
+        # Discover the replay targets (the "shards"). Sharded: listShards via mongos. Replica set
+        # (TOPOLOGY=replicaset): the single RS from the OM cluster detail — no mongos. The OM replicaSet
+        # id is the segment-dir name the tailer wrote under, and it equals the replSetName used in the
+        # mongorestore --host connection string.
+        if config.CFG.Topology == "replicaset":
+            cd = config.invoke_om_api(
+                path=f"group/{config.CFG.GroupId}/clusters/{config.CFG.ClusterId}"
+            )
+            rsets = cd.get("replicaSets") or []
+            if not rsets:
+                raise RuntimeError(
+                    "OM cluster detail returned no replicaSets for the replica-set deployment."
+                )
+            rs0 = rsets[0]
+            rs_id = rs0.get("id")
+            members = [n.get("id") for n in (rs0.get("nodes") or []) if n.get("id")]
+            if not rs_id or not members:
+                raise RuntimeError(
+                    f"Could not resolve replica-set id/members from OM (id={rs_id}, members={members})."
+                )
+            shards = [{"shardId": rs_id, "rsHosts": f"{rs_id}/{','.join(members)}", "host": members[0]}]
+        else:
+            shard_json = config.invoke_mongosh_js(
+                ssh_target=config.CFG.MongosHost,
+                uri=f"mongodb://{config.CFG.MongosHost}:{config.CFG.MongosPort}",
+                js=config.LIST_SHARDS_JS,
+                context="listShards via mongos",
+            )
+            shards = json.loads(shard_json)
 
-        config.write_host("  Current shard primaries:", fg=config.CYAN)
+        config.write_host("  Replay targets (shard/RS -> host):", fg=config.CYAN)
         for s in shards:
             config.write_host(f"    {s['shardId']} -> {s['host']}", fg=WHITE)
 
-        # Warm up each shard's routing cache via mongos before per-shard replay.
-        config.write_host("\n  Warming up shard routing cache via mongos...", fg=config.CYAN)
-        warmup_script = (
-            "var dbs=db.adminCommand({listDatabases:1}).databases; "
-            "for(var i=0;i<dbs.length;i++){try{db.getSiblingDB(dbs[i].name).getCollectionNames();}catch(e){}} "
-            "print('routing-cache-warmed');"
-        )
-        # Best-effort (non-fatal) warm-up.
-        try:
-            warmup_out = config.invoke_mongosh_js(
-                ssh_target=config.CFG.MongosHost,
-                uri=f"mongodb://{config.CFG.MongosHost}:{config.CFG.MongosPort}",
-                js=warmup_script,
-                context="routing-cache warm-up",
+        # Warm up each shard's routing cache via mongos before per-shard replay (sharded only — a
+        # replica set has no mongos router to warm).
+        if config.CFG.Topology != "replicaset":
+            config.write_host("\n  Warming up shard routing cache via mongos...", fg=config.CYAN)
+            warmup_script = (
+                "var dbs=db.adminCommand({listDatabases:1}).databases; "
+                "for(var i=0;i<dbs.length;i++){try{db.getSiblingDB(dbs[i].name).getCollectionNames();}catch(e){}} "
+                "print('routing-cache-warmed');"
             )
-            if re.search("routing-cache-warmed", warmup_out):
-                config.write_host("  Routing cache warm-up complete", fg=config.GREEN)
-            else:
-                config.write_host(
-                    f"  WARNING: routing cache warm-up returned unexpected output: {warmup_out}",
-                    fg=config.YELLOW,
+            # Best-effort (non-fatal) warm-up.
+            try:
+                warmup_out = config.invoke_mongosh_js(
+                    ssh_target=config.CFG.MongosHost,
+                    uri=f"mongodb://{config.CFG.MongosHost}:{config.CFG.MongosPort}",
+                    js=warmup_script,
+                    context="routing-cache warm-up",
                 )
-        except Exception as e:  # noqa: BLE001
-            config.write_host(
-                f"  WARNING: routing cache warm-up failed (non-fatal): {e}", fg=config.YELLOW
-            )
+                if re.search("routing-cache-warmed", warmup_out):
+                    config.write_host("  Routing cache warm-up complete", fg=config.GREEN)
+                else:
+                    config.write_host(
+                        f"  WARNING: routing cache warm-up returned unexpected output: {warmup_out}",
+                        fg=config.YELLOW,
+                    )
+            except Exception as e:  # noqa: BLE001
+                config.write_host(
+                    f"  WARNING: routing cache warm-up failed (non-fatal): {e}", fg=config.YELLOW
+                )
 
         errors: list[str] = []
 
