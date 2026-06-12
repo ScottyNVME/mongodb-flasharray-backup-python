@@ -19,6 +19,7 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 new-mongo-snapshot            = "mongodb_flasharray_backup.snapshot:main"
 restore-mongo-snapshot        = "mongodb_flasharray_backup.restore:main"
+restore-mongo-snapshot-to-target = "mongodb_flasharray_backup.restore_to_target:main"
 initialize-protection-groups  = "mongodb_flasharray_backup.init_protection_groups:main"
 remove-old-artifacts          = "mongodb_flasharray_backup.remove_old_artifacts:main"
 start-oplog-tailer            = "mongodb_flasharray_backup.pitr.start_oplog_tailer:main"
