@@ -317,27 +317,29 @@ def _run(
                 )
             config.write_host("  All node volume members confirmed in snapshot.", fg=config.GREEN)
 
-            # Discover the underlying block device backing /data/mongo on each node.
-            node_device: dict[str, str] = {}
+            # Discover the underlying block device(s) backing /data/mongo on each node -- a single pRDM, or
+            # several PVs for an LVM/multipath mount. Captured BEFORE the unmount so STEP 5 can rescan them.
+            node_devices: dict[str, list[str]] = {}
             for node in cluster_nodes:
                 cmd = (
-                    'p=$(findmnt -no SOURCE /data/mongo 2>/dev/null); if [ -n "$p" ]; then '
-                    'lsblk -no PKNAME "$p" 2>/dev/null; else '
-                    "lsblk -dno NAME,SERIAL 2>/dev/null | awk '$2 ~ /^[0-9a-fA-F]{20,}$/ {print $1; exit}'; fi"
+                    'src=$(findmnt -no SOURCE /data/mongo 2>/dev/null); '
+                    'if [ -n "$src" ]; then lsblk -s -rno NAME,TYPE "$src" 2>/dev/null '
+                    "| awk '$2 == \"disk\" {print $1}' | sort -u; "
+                    "else lsblk -dno NAME,SERIAL 2>/dev/null | awk '$2 ~ /^[0-9a-fA-F]{20,}$/ {print $1}'; fi"
                 )
                 proc = subprocess.run(
                     ["ssh", *config.SSH_OPTS, f"{config.CFG.SshUser}@{node}", cmd],
                     capture_output=True,
                     text=True,
                 )
-                disk = proc.stdout.strip()
-                if not disk or not re.match(r"^[a-z0-9]+$", disk):
+                disks = [d.strip() for d in proc.stdout.splitlines() if re.match(r"^[a-z0-9]+$", d.strip())]
+                if not disks:
                     raise RuntimeError(
-                        f"Could not derive parent block device for /data/mongo on {node} (got: '{disk}'). "
-                        "Verify the Pure Storage pRDM is presented."
+                        f"Could not derive backing block device(s) for /data/mongo on {node} "
+                        f"(got: '{proc.stdout.strip()}'). Verify the Pure pRDM / multipath LUNs are presented."
                     )
-                node_device[node] = disk
-                config.write_host(f"  Device on {node}: /dev/{disk}", fg=config.CYAN)
+                node_devices[node] = disks
+                config.write_host(f"  Device(s) on {node}: {', '.join('/dev/' + d for d in disks)}", fg=config.CYAN)
 
             # Destructive-operation confirmation.
             if not force:
@@ -527,31 +529,43 @@ def _run(
             def _step5_rescan_mount(node):
                 user = config.CFG.SshUser
                 opts = config.SSH_OPTS
-                devices = node_device
-                disk = devices[node]  # e.g. 'sdb'
+                disks = node_devices[node]  # one disk (pRDM) or several PVs (LVM/multipath)
 
-                # Remote shell script: only the disk name is interpolated; the rest of the
-                # shell variables are evaluated on the remote host.
+                # Rescan every backing disk, then reactivate any LVM VG (pvscan/vgchange are harmless
+                # no-ops when there is no LVM) and mount via fstab. Single-disk also gets a read-only fs
+                # integrity check on its partition. NOTE: the multi-disk/LVM reactivation path is exercised
+                # structurally on single-volume but its full behavior needs live validation on an LVM cluster.
+                disks_sh = " ".join(disks)
+                single = "1" if len(disks) == 1 else "0"
                 cmd = (
                     "set -e\n"
-                    f"DISK={disk}\n"
-                    "echo 1 | sudo tee /sys/block/$DISK/device/rescan > /dev/null\n"
-                    "sleep 1\n"
-                    "sudo blockdev --rereadpt /dev/$DISK 2>/dev/null || sudo partprobe /dev/$DISK 2>/dev/null || true\n"
-                    "sudo udevadm settle --timeout=15\n"
-                    "PART=$(lsblk -lno NAME,TYPE /dev/$DISK 2>/dev/null | awk '$2 == \"part\" {print \"/dev/\" $1; exit}')\n"
-                    'if [ -z "$PART" ]; then PART=/dev/$DISK; fi\n'
-                    'FSTYPE=$(sudo blkid -s TYPE -o value "$PART" 2>/dev/null || echo "")\n'
-                    'echo "device=$PART fstype=$FSTYPE"\n'
+                    f'DISKS="{disks_sh}"\n'
+                    f"SINGLE={single}\n"
+                    "for D in $DISKS; do\n"
+                    "  echo 1 | sudo tee /sys/block/$D/device/rescan > /dev/null 2>&1 || true\n"
+                    "  sudo blockdev --rereadpt /dev/$D 2>/dev/null || sudo partprobe /dev/$D 2>/dev/null || true\n"
+                    "done\n"
+                    "sudo udevadm settle --timeout=15 || true\n"
+                    "sudo pvscan --cache >/dev/null 2>&1 || true\n"      # LVM: pick up the rescanned PVs
+                    "sudo vgchange -ay >/dev/null 2>&1 || true\n"         # LVM: (re)activate VGs; no-op if none
                     "set +e\n"
-                    'case "$FSTYPE" in\n'
-                    '  xfs)            sudo xfs_repair -n "$PART" >/dev/null 2>&1 ;;\n'
-                    '  ext2|ext3|ext4) sudo e2fsck -n -f "$PART" >/dev/null 2>&1 ;;\n'
-                    "  *)              echo \"WARN: unknown fstype '$FSTYPE' - skipping RO integrity check\"; true ;;\n"
-                    "esac\n"
-                    "INTEG=$?\n"
-                    "if [ $INTEG -ne 0 ]; then\n"
-                    '  echo "WARN: RO integrity check exit $INTEG (advisory; mount will replay journal)"\n'
+                    'if [ "$SINGLE" = "1" ]; then\n'
+                    "  D=$DISKS\n"
+                    "  PART=$(lsblk -lno NAME,TYPE /dev/$D 2>/dev/null | awk '$2 == \"part\" {print \"/dev/\" $1; exit}')\n"
+                    '  if [ -z "$PART" ]; then PART=/dev/$D; fi\n'
+                    '  FSTYPE=$(sudo blkid -s TYPE -o value "$PART" 2>/dev/null || echo "")\n'
+                    '  echo "device=$PART fstype=$FSTYPE"\n'
+                    '  case "$FSTYPE" in\n'
+                    '    xfs)            sudo xfs_repair -n "$PART" >/dev/null 2>&1 ;;\n'
+                    '    ext2|ext3|ext4) sudo e2fsck -n -f "$PART" >/dev/null 2>&1 ;;\n'
+                    "    *)              echo \"WARN: unknown fstype '$FSTYPE' - skipping RO integrity check\"; true ;;\n"
+                    '  esac\n'
+                    "  INTEG=$?\n"
+                    "  if [ $INTEG -ne 0 ]; then\n"
+                    '    echo "WARN: RO integrity check exit $INTEG (advisory; mount will replay journal)"\n'
+                    "  fi\n"
+                    "else\n"
+                    '  echo "device=(LVM/multi: $DISKS) - skipping per-partition integrity check"\n'
                     "fi\n"
                     "set -e\n"
                     "sudo mount /data/mongo\n"
@@ -559,7 +573,8 @@ def _run(
                     'echo "mounted"'
                 )
                 config.write_host(
-                    f"  {node}: rescan + integrity check + mount /dev/{disk} ...", fg=config.CYAN
+                    f"  {node}: rescan {len(disks)} device(s) + reactivate LVM + mount /data/mongo ...",
+                    fg=config.CYAN,
                 )
                 proc = subprocess.run(
                     ["ssh", *opts, f"{user}@{node}", cmd],
