@@ -93,19 +93,20 @@ def _run(
     config.write_host(
         "  Discovering node-to-volume mappings via SCSI serial...", fg=config.CYAN
     )
-    node_volume_map = config.resolve_node_to_array_volume_map(
+    node_volume_map = config.discover_node_volumes(
         fa,
         cluster_nodes,
         config.CFG.SshUser,
         config.SSH_OPTS,
         all_context_names,
     )
+    _total_vols = sum(len(v) for v in node_volume_map.values())
 
     # Persist the node->volume map as copyable FA volume tags so snapshot/restore can read it without
     # per-node SSH/SCSI discovery (the slow path at scale). Re-run after any topology change.
     if what_if:
         config.write_host(
-            f"  [WhatIf] Would tag {len(node_volume_map)} volume(s) with the node->volume map "
+            f"  [WhatIf] Would tag {_total_vols} volume(s) with the node->volume map "
             f"(deployment={config.CFG.DeploymentName or '(default)'}).",
             fg=config.DARK_YELLOW,
         )
@@ -115,8 +116,9 @@ def _run(
 
     errors: list[str] = []
 
-    # Iterate node->volume map, create PG + member, verify.
-    for node, entry in node_volume_map.items():
+    # Iterate node->volume map, create PG + member, verify. Flattened to one pass per backing volume so a
+    # multi-volume (LVM/multipath) node adds all of its volumes.
+    for node, entry in [(n, e) for n, vols in node_volume_map.items() for e in vols]:
         short_name = entry["ShortName"]
         volume_name = entry["VolumeName"]
 

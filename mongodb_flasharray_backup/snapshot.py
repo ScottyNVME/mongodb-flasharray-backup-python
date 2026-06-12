@@ -210,7 +210,7 @@ def _run(
 
         # Verify every discovered data volume is actually a member of the protection group.
         config.write_host("  Verifying all data volumes are PG members...", fg=config.CYAN)
-        for Node, entry in NodeVolumeMap.items():
+        for Node, entry in [(n, e) for n, _vols in NodeVolumeMap.items() for e in _vols]:
             ShortName = entry["ShortName"]
             VolumeName = entry["VolumeName"]
             Member = None
@@ -493,7 +493,7 @@ def _run(
                     try:
                         # mongo:volumes tag value: sorted, comma-joined volume names from the node map.
                         volumes_value = ",".join(
-                            sorted(v["VolumeName"] for v in NodeVolumeMap.values())
+                            sorted(vol["VolumeName"] for vols in NodeVolumeMap.values() for vol in vols)
                         )
                         presnap_value = (
                             json.dumps(PreSnapBaseline, separators=(",", ":")) if PreSnapBaseline else "{}"

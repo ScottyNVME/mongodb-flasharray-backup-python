@@ -236,11 +236,12 @@ def test_parse_volume_map_tags_groups_and_filters_by_deployment():
     ]
     m = config.parse_volume_map_tags(rows, "sn1-x90r2-f07-27", "aen-cluster")
     assert m == {
-        "aen-mongo-01": {
+        "aen-mongo-01": [{
             "ShortName": "sn1-x90r2-f07-27",
             "VolumeName": "aen-mongo-01-data",
             "Serial": "1071bf0a0a224a050019bf3b",
-        }
+            "PvIndex": 0,
+        }]
     }
 
 

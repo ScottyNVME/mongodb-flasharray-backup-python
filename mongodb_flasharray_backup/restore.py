@@ -253,10 +253,12 @@ def _run(
                 config.CFG.DeploymentName,
             )
 
-            # Guard: every expected volume must have been discovered.
-            if len(node_volume_map) != expected_snap_count:
+            # Guard: every expected volume must have been resolved (count across all nodes' volumes,
+            # since a multi-volume/LVM node maps to several FA volumes).
+            _discovered_vols = sum(len(v) for v in node_volume_map.values())
+            if _discovered_vols != expected_snap_count:
                 raise RuntimeError(
-                    f"SCSI volume discovery found {len(node_volume_map)} of {expected_snap_count} "
+                    f"Volume resolution found {_discovered_vols} of {expected_snap_count} "
                     "expected volumes - aborting before any changes are made. Verify all cluster nodes "
                     "are reachable and their data volumes are presented."
                 )
@@ -266,7 +268,7 @@ def _run(
                 f"  Verifying all node volumes are present in snapshot '{snapshot_tag}'...",
                 fg=config.CYAN,
             )
-            for node, entry in node_volume_map.items():
+            for node, entry in [(n, e) for n, _vols in node_volume_map.items() for e in _vols]:
                 short_name = entry["ShortName"]
                 volume_name = entry["VolumeName"]
                 member_snap = f"{config.CFG.ProtectionGroupName}.{snapshot_tag}.{volume_name}"
@@ -462,7 +464,7 @@ def _run(
             )
 
             restore_failures: list[str] = []
-            for node, entry in node_volume_map.items():
+            for node, entry in [(n, e) for n, _vols in node_volume_map.items() for e in _vols]:
                 short_name = entry["ShortName"]
                 volume_name = entry["VolumeName"]
                 # PG snapshot member name: <pgname>.<tag>.<volumename>
