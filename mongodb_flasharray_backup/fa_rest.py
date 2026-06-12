@@ -338,3 +338,23 @@ class Client:
                                                   tag: Any = None, context_names: Optional[list] = None):
         return self._direct(self._target(context_names), "PUT", "protection-group-snapshots/tags/batch",
                            params={"resource_names": self._csv(resource_names)}, body=tag)
+
+    # ---- volume tags: the precomputed OS-disk -> FA-volume map (namespace 'mongo-backup') ----------------
+    # Also DIRECT to the target array (the gateway does not route /tags). resource_names = volume names.
+    def get_volumes_tags(self, resource_names: Optional[list] = None, namespaces: Optional[list] = None,
+                         context_names: Optional[list] = None):
+        return self._direct(self._target(context_names), "GET", "volumes/tags",
+                           params={"resource_names": self._csv(resource_names),
+                                   "namespaces": self._csv(namespaces)})
+
+    def put_volumes_tags_batch(self, resource_names: Optional[list] = None, tag: Any = None,
+                               context_names: Optional[list] = None):
+        # tag = list of {"key","value","namespace"} dicts applied to every resource in resource_names.
+        return self._direct(self._target(context_names), "PUT", "volumes/tags/batch",
+                           params={"resource_names": self._csv(resource_names)}, body=tag)
+
+    def delete_volumes_tags(self, resource_names: Optional[list] = None, keys: Optional[list] = None,
+                            namespaces: Optional[list] = None, context_names: Optional[list] = None):
+        return self._direct(self._target(context_names), "DELETE", "volumes/tags",
+                           params={"resource_names": self._csv(resource_names), "keys": self._csv(keys),
+                                   "namespaces": self._csv(namespaces)})
