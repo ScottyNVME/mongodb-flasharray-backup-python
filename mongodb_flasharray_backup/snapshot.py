@@ -200,10 +200,12 @@ def _run(
         config.write_host("  Discovering cluster nodes...", fg=config.CYAN)
         ClusterNodes = config.get_cluster_nodes()
 
-        # Discover which FA volume backs /data/mongo on each node via SCSI serial.
-        config.write_host("  Discovering node-to-volume mappings via SCSI serial...", fg=config.CYAN)
-        NodeVolumeMap = config.resolve_node_to_array_volume_map(
-            FA, ClusterNodes, cfg.SshUser, config.SSH_OPTS, FaContextNames
+        # Resolve node->volume from the precomputed FA volume-map tags (one GET /volumes/tags per array,
+        # no SSH); falls back to live SSH+SCSI discovery for any untagged/stale node. Re-run
+        # initialize-protection-groups after a topology change to refresh the tags.
+        config.write_host("  Resolving node-to-volume mappings (volume tags, SSH fallback)...", fg=config.CYAN)
+        NodeVolumeMap = config.resolve_node_volume_map(
+            FA, ClusterNodes, cfg.SshUser, config.SSH_OPTS, FaContextNames, cfg.DeploymentName
         )
 
         # Verify every discovered data volume is actually a member of the protection group.

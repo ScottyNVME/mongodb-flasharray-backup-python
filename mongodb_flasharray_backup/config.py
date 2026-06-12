@@ -841,7 +841,7 @@ def resolve_node_to_array_volume_map(
             )
             if vols:
                 vol = vols[0]
-                node_map[node] = {"ShortName": ctx_name, "VolumeName": vol.name}
+                node_map[node] = {"ShortName": ctx_name, "VolumeName": vol.name, "Serial": serial}
                 write_host(f"    -> {ctx_name} / {vol.name}", fg=GREEN)
                 found = True
                 break
@@ -855,6 +855,120 @@ def resolve_node_to_array_volume_map(
                 "presented from the expected array."
             )
     return node_map
+
+
+# --- Tag-based OS-disk -> FA-volume map ----------------------------------------------------------------
+# At scale, resolving the node->volume map by SSH + SCSI serial on every snapshot/restore is slow. Instead
+# we precompute it once per topology change (initialize-protection-groups) and store it on the FA volumes
+# as tags, then read it on the hot path (one GET /volumes/tags per array, no SSH). Tags use the 'mongo:'
+# key prefix in the default namespace and are copyable (so the map travels with snapshots/clones).
+MONGO_DATA_MOUNT = "/data/mongo"
+VOLMAP_TAG_DEPLOYMENT = "mongo:deployment"
+VOLMAP_TAG_NODE = "mongo:node"
+VOLMAP_TAG_MOUNT = "mongo:mountpoint"
+VOLMAP_TAG_SERIAL = "mongo:serial"
+VOLMAP_TAG_VG = "mongo:vg"            # LVM volume group (empty for a direct device); for multi-volume nodes
+VOLMAP_TAG_PVINDEX = "mongo:pvindex"  # ordinal of this volume within its VG (0 for single-volume)
+
+
+def write_volume_map_tags(fa: Any, deployment: Optional[str], node_map: dict, mountpoint: str = MONGO_DATA_MOUNT) -> int:
+    """Write the OS-disk -> FA-volume mapping onto each FA volume as copyable tags. `node_map` is the
+    resolver output (node -> {'ShortName','VolumeName','Serial', optional 'Vg','PvIndex'}). Returns the
+    number of volumes tagged."""
+    dep = deployment or ""
+    n = 0
+    for node, info in node_map.items():
+        tags = [
+            {"key": VOLMAP_TAG_DEPLOYMENT, "value": dep, "copyable": True},
+            {"key": VOLMAP_TAG_NODE, "value": node, "copyable": True},
+            {"key": VOLMAP_TAG_MOUNT, "value": mountpoint, "copyable": True},
+            {"key": VOLMAP_TAG_SERIAL, "value": info.get("Serial", ""), "copyable": True},
+            {"key": VOLMAP_TAG_VG, "value": info.get("Vg", ""), "copyable": True},
+            {"key": VOLMAP_TAG_PVINDEX, "value": str(info.get("PvIndex", 0)), "copyable": True},
+        ]
+        _fa(fa.put_volumes_tags_batch(resource_names=[info["VolumeName"]], tag=tags,
+                                      context_names=[info["ShortName"]]))
+        write_host(f"    tagged {info['ShortName']}/{info['VolumeName']} <- node={node} mount={mountpoint}", fg=GREEN)
+        n += 1
+    return n
+
+
+def parse_volume_map_tags(tag_rows: list, ctx_name: str, deployment: Optional[str]) -> dict:
+    """Group a GET /volumes/tags response (rows with .resource=<volume name>, .key, .value) by volume and
+    return node -> {'ShortName','VolumeName','Serial'} for tags whose mongo:deployment matches. Pure
+    (unit-testable)."""
+    by_vol: dict[str, dict] = {}
+    for t in tag_rows or []:
+        key = getattr(t, "key", None)
+        # The FA GET /volumes/tags row carries `resource` as a nested object {name,id}; fall back to a
+        # plain string for unit tests / older shapes.
+        res = getattr(t, "resource", None)
+        vol = getattr(res, "name", res) if res is not None else None
+        if not key or not str(key).startswith("mongo:") or not vol or not isinstance(vol, str):
+            continue
+        by_vol.setdefault(vol, {})[key] = getattr(t, "value", None)
+    out: dict[str, dict] = {}
+    for vol, kv in by_vol.items():
+        if (kv.get(VOLMAP_TAG_DEPLOYMENT) or "") != (deployment or ""):
+            continue
+        node = kv.get(VOLMAP_TAG_NODE)
+        if not node:
+            continue
+        out[node] = {"ShortName": ctx_name, "VolumeName": vol, "Serial": (kv.get(VOLMAP_TAG_SERIAL) or "")}
+    return out
+
+
+def read_volume_map_tags(fa: Any, deployment: Optional[str], context_names: list[str]) -> dict:
+    """Read the volume-map tags across the given arrays (one GET /volumes/tags per array, NO SSH) and
+    return node -> {'ShortName','VolumeName','Serial'} for the deployment."""
+    node_map: dict[str, dict] = {}
+    for ctx in context_names:
+        rows = _fa(fa.get_volumes_tags(context_names=[ctx]), allow_error=True) or []
+        node_map.update(parse_volume_map_tags(rows, ctx, deployment))
+    return node_map
+
+
+def resolve_node_volume_map(fa: Any, nodes: list[str], ssh_user_param: str, ssh_opts_param: list[str],
+                            context_names: list[str], deployment: Optional[str],
+                            mountpoint: str = MONGO_DATA_MOUNT, verify: bool = True) -> dict[str, dict[str, str]]:
+    """Fast-path node -> {'ShortName','VolumeName'} resolver. Reads the precomputed volume-map tags (no
+    SSH); when verify=True, cross-checks each tagged volume's serial against the array (one GET /volumes
+    per array, no SSH) and, for any node that is untagged or whose serial no longer matches, falls back to
+    live SSH + SCSI discovery for that node only. With no tags present this degrades to the original
+    per-node discovery, so it is safe/backward-compatible."""
+    tagged = read_volume_map_tags(fa, deployment, context_names)
+    resolved: dict[str, dict[str, str]] = {}
+    fallback_nodes: list[str] = []
+
+    actual_serial: dict[str, dict[str, str]] = {}  # array -> {volume: SERIAL}
+    if verify and tagged:
+        for ctx in {info["ShortName"] for info in tagged.values()}:
+            vols = _fa(fa.get_volumes(context_names=[ctx]), allow_error=True) or []
+            actual_serial[ctx] = {getattr(v, "name", None): (getattr(v, "serial", "") or "") for v in vols}
+
+    for node in nodes:
+        info = tagged.get(node)
+        if not info:
+            fallback_nodes.append(node)
+            continue
+        if verify and info.get("Serial"):
+            got = (actual_serial.get(info["ShortName"], {}).get(info["VolumeName"]) or "").lower()
+            if got != info["Serial"].lower():
+                write_host(f"    volume-map tag stale for {node} (serial {info['Serial']} != "
+                           f"{got or 'none'}) - rediscovering", fg=YELLOW)
+                fallback_nodes.append(node)
+                continue
+        resolved[node] = {"ShortName": info["ShortName"], "VolumeName": info["VolumeName"]}
+
+    if resolved:
+        write_host(f"  Resolved {len(resolved)} node(s) from volume tags (no SSH).", fg=GREEN)
+    if fallback_nodes:
+        write_host(f"  SSH-discovery fallback for {len(fallback_nodes)} node(s): {', '.join(fallback_nodes)}",
+                   fg=DARK_YELLOW)
+        disc = resolve_node_to_array_volume_map(fa, fallback_nodes, ssh_user_param, ssh_opts_param, context_names)
+        for n, v in disc.items():
+            resolved[n] = {"ShortName": v["ShortName"], "VolumeName": v["VolumeName"]}
+    return resolved
 
 
 # endregion

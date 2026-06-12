@@ -192,7 +192,9 @@ def test_resolve_node_to_array_volume_map_selects_last_valid_serial(tmp_path, mo
     result = config.resolve_node_to_array_volume_map(
         _FakeFA(), ["node1.example.com"], "ec2-user", config.SSH_OPTS, ["arr-07"]
     )
-    assert result == {"node1.example.com": {"ShortName": "arr-07", "VolumeName": "mongo-vol-1"}}
+    assert result == {
+        "node1.example.com": {"ShortName": "arr-07", "VolumeName": "mongo-vol-1", "Serial": serial.lower()}
+    }
     # serial lower-cased then upper-cased in the FA filter (FA stores uppercase hex)
     assert captured["filter"] == f"serial='{serial.upper()}'"
 
@@ -210,3 +212,40 @@ def test_resolve_node_to_array_volume_map_bad_serial_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Could not read FA volume serial"):
         config.resolve_node_to_array_volume_map(_FakeFA(), ["n1"], "u", config.SSH_OPTS, ["c"])
+
+
+# --------------------------------------------------------------------------------------------------------
+# Tag-based volume-map parsing (parse_volume_map_tags) — pure logic, no live array.
+# --------------------------------------------------------------------------------------------------------
+class _TagRow:
+    """Mimics a FA GET /volumes/tags row: .resource (volume name), .key, .value."""
+    def __init__(self, resource, key, value):
+        self.resource, self.key, self.value = resource, key, value
+
+
+def test_parse_volume_map_tags_groups_and_filters_by_deployment():
+    rows = [
+        _TagRow("aen-mongo-01-data", config.VOLMAP_TAG_DEPLOYMENT, "aen-cluster"),
+        _TagRow("aen-mongo-01-data", config.VOLMAP_TAG_NODE, "aen-mongo-01"),
+        _TagRow("aen-mongo-01-data", config.VOLMAP_TAG_SERIAL, "1071bf0a0a224a050019bf3b"),
+        # different deployment -> excluded
+        _TagRow("aen-mongo-09-data", config.VOLMAP_TAG_DEPLOYMENT, "other-dep"),
+        _TagRow("aen-mongo-09-data", config.VOLMAP_TAG_NODE, "aen-mongo-09"),
+        # non-mongo tag -> ignored
+        _TagRow("vol-x", "purity:thing", "ignored"),
+    ]
+    m = config.parse_volume_map_tags(rows, "sn1-x90r2-f07-27", "aen-cluster")
+    assert m == {
+        "aen-mongo-01": {
+            "ShortName": "sn1-x90r2-f07-27",
+            "VolumeName": "aen-mongo-01-data",
+            "Serial": "1071bf0a0a224a050019bf3b",
+        }
+    }
+
+
+def test_parse_volume_map_tags_empty_and_missing_node():
+    assert config.parse_volume_map_tags([], "arr", "dep") == {}
+    # deployment matches but no node tag -> skipped
+    rows = [_TagRow("v1", config.VOLMAP_TAG_DEPLOYMENT, "dep")]
+    assert config.parse_volume_map_tags(rows, "arr", "dep") == {}

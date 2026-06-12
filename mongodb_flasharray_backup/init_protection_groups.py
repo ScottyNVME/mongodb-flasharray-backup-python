@@ -101,6 +101,18 @@ def _run(
         all_context_names,
     )
 
+    # Persist the node->volume map as copyable FA volume tags so snapshot/restore can read it without
+    # per-node SSH/SCSI discovery (the slow path at scale). Re-run after any topology change.
+    if what_if:
+        config.write_host(
+            f"  [WhatIf] Would tag {len(node_volume_map)} volume(s) with the node->volume map "
+            f"(deployment={config.CFG.DeploymentName or '(default)'}).",
+            fg=config.DARK_YELLOW,
+        )
+    else:
+        config.write_host("  Writing node->volume map tags...", fg=config.CYAN)
+        config.write_volume_map_tags(fa, config.CFG.DeploymentName, node_volume_map)
+
     errors: list[str] = []
 
     # Iterate node->volume map, create PG + member, verify.
