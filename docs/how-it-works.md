@@ -293,7 +293,9 @@ Tags `ClusterName`, `BackupTimestamp`, and `BackupType` are written inline at cr
 
 ## Node-to-Volume Discovery
 
-Every run of `new-mongo-snapshot` and `restore-mongo-snapshot` resolves the full storage path for each node at runtime — no static configuration file maps nodes to arrays. The discovery chain runs in `resolve_node_to_array_volume_map` in `config.py` and has five steps.
+**Fast path (default): FlashArray volume tags.** Resolving the storage path per node on *every* snapshot/restore by SSH is slow at scale. `initialize-protection-groups` therefore precomputes the map once and writes it onto each FA volume as **copyable `mongo:` tags** — `deployment`, `node`, `mountpoint`, `serial`, `vg`, `pvindex`. On the hot path, `resolve_node_volume_map` reads those tags (one `GET /volumes/tags` per array, **no SSH**), cross-checks each volume's serial against the array, and falls back to live discovery only for an untagged or stale node. **Re-run `initialize-protection-groups` after any topology change** (node/shard add or remove) to refresh the tags. (With no tags present the resolver degrades to full live discovery, so it stays correct out of the box.)
+
+**Discovery chain (runs at tag time, and as the fallback).** `discover_node_volumes` walks each node's data mount to *all* its backing FA volumes, returning `node -> [volumes]` — one entry for a single pRDM, several for an **LVM/multipath** mount whose VG spans multiple PVs. For a direct device it is the five steps below; for LVM it walks the inverse device tree (`lsblk -s`: mount → LV → VG → PVs → multipath) and reads each volume's serial from the SERIAL column (24-hex) or the NAA WWN (`0x624a9370<serial>`), de-duplicating multiple paths to the same volume. The original single-device chain (`resolve_node_to_array_volume_map`) has five steps:
 
 ### Step 1 — Find the mounted partition (`findmnt`)
 

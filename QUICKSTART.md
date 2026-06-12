@@ -123,6 +123,10 @@ initialize-protection-groups              # apply
 Expected: `Protection group '<FA_PROTECTION_GROUP>' is ready on all arrays.` Re-run any time the topology
 changes (a node or array added/removed); it's idempotent. Use `--prune` to drop volumes no longer in the cluster.
 
+> It also **records the node→volume map as FlashArray volume tags** (`mongo:node`, `mongo:serial`, …) so
+> `new-mongo-snapshot`/`restore-mongo-snapshot` resolve each node's volume(s) by reading tags (no per-node
+> SSH) — much faster at scale. **This is why you re-run it after a topology change:** to refresh the tags.
+
 ---
 
 ## 5. Take a snapshot

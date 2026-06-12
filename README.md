@@ -181,8 +181,11 @@ SCSI-serial selection, oplog decode). The end-to-end orchestration is installed 
   error becomes an empty result (for best-effort reads) or raises (for required operations).
 - **Ops Manager auth** uses a manual RFC 2617 Digest flow over `requests`.
 - **Topology and storage mappings are discovered at runtime** — cluster nodes from Ops Manager (with a
-  `CLUSTER_NODES` fallback that `initialize-protection-groups` keeps current), and node→array→volume mappings
-  from SCSI serial numbers — so the workflow adapts automatically as nodes or arrays are added or removed.
+  `CLUSTER_NODES` fallback that `initialize-protection-groups` keeps current). The **node→array→volume map is
+  precomputed and stored as copyable FlashArray volume tags** by `initialize-protection-groups` (re-run it
+  after a topology change); snapshot/restore then read the tags (one `GET /volumes/tags` per array, **no
+  per-node SSH**), verify each volume's serial, and fall back to live SCSI/LVM discovery only for an
+  untagged/stale node. Handles single-volume **and** multi-volume (LVM-over-multipath) mounts.
 - **Topology-agnostic by design.** Snapshot node-selection iterates the Ops Manager third-party cluster
   detail's `replicaSets` (not `listShards`), so it works for sharded clusters and standalone replica sets
   alike. The only `mongos`/`listShards` call sites — the restore-stabilization wait and the PIT oplog anchors —
