@@ -857,6 +857,84 @@ def resolve_node_to_array_volume_map(
     return node_map
 
 
+# Multi-volume discovery: the full downward device tree of the data mount, so a mount backed by an LVM VG
+# over several PVs (each a FlashArray volume, possibly via device-mapper multipath) resolves to ALL its
+# backing FA volumes. -s = inverse (toward physical); -r = raw (parsed by token, robust to empty columns).
+_MULTI_SERIAL_CMD = (
+    'src=$(findmnt -no SOURCE --target /data/mongo 2>/dev/null); [ -z "$src" ] && exit 0; '
+    'lsblk -s -rno TYPE,NAME,SERIAL,WWN "$src" 2>/dev/null'
+)
+
+
+def parse_fa_volume_serials(lsblk_output: str) -> list[str]:
+    """Extract the distinct Pure FlashArray volume serials backing a mount, from `lsblk -s -rno
+    TYPE,NAME,SERIAL,WWN` output. A serial comes from the SERIAL column (24-hex, a direct pRDM) or the WWN
+    column (NAA `0x624a9370<serial>`, a multipath device). Order-preserving and de-duplicated, so multiple
+    paths to the same FA volume collapse to one. Pure (unit-testable)."""
+    serials: list[str] = []
+    seen: set[str] = set()
+    for line in (lsblk_output or "").splitlines():
+        serial: Optional[str] = None
+        for tok in line.split()[1:]:  # skip the TYPE column; scan remaining tokens for a serial form
+            tl = tok.strip().lower()
+            if re.fullmatch(r"[0-9a-f]{24}", tl):
+                serial = tl
+                break
+            m = re.fullmatch(r"(?:0x)?624a9370([0-9a-f]{24})", tl)
+            if m:
+                serial = m.group(1)
+                break
+        if serial and serial not in seen:
+            seen.add(serial)
+            serials.append(serial)
+    return serials
+
+
+def discover_node_volumes(fa: Any, nodes: list[str], ssh_user_param: str, ssh_opts_param: list[str],
+                          context_names: list[str]) -> dict[str, list[dict]]:
+    """Multi-volume node->volumes discovery. For each node, SSH the data mount's full device tree and map
+    EVERY backing FA volume. Returns node -> [ {'ShortName','VolumeName','Serial','PvIndex'} ] (a
+    single-volume node yields a 1-element list). Throws if a node resolves to zero volumes or a serial has
+    no matching FA volume. This is the slow path, run at tag time (initialize-protection-groups) and as the
+    resolver's fallback."""
+    node_map: dict[str, list[dict]] = {}
+    for node in nodes:
+        serials: list[str] = []
+        for attempt in range(1, 4):
+            proc = subprocess.run(["ssh", *ssh_opts_param, f"{ssh_user_param}@{node}", _MULTI_SERIAL_CMD],
+                                  capture_output=True, text=True)
+            serials = parse_fa_volume_serials(proc.stdout)
+            if serials:
+                break
+            if attempt < 3:
+                time.sleep(1)
+        if not serials:
+            raise RuntimeError(
+                f"Could not resolve any FlashArray volume backing /data/mongo on {node}. Verify the mount "
+                "exists and its block device(s) are Pure pRDMs / multipath LUNs."
+            )
+        vols: list[dict] = []
+        for idx, serial in enumerate(serials):
+            found = None
+            for ctx_name in context_names:
+                r = _fa(fa.get_volumes(context_names=[ctx_name], filter=f"serial='{serial.upper()}'"),
+                        allow_error=True)
+                if r:
+                    found = {"ShortName": ctx_name, "VolumeName": r[0].name, "Serial": serial, "PvIndex": idx}
+                    break
+            if not found:
+                raise RuntimeError(
+                    f"No FlashArray volume with serial '{serial}' found for node {node} on any of "
+                    f"{len(context_names)} array(s). Run initialize-protection-groups, or verify the volume "
+                    "is presented from a fleet array with a protection group."
+                )
+            vols.append(found)
+        node_map[node] = vols
+        write_host(f"  {node}: {len(vols)} volume(s) -> "
+                   + ", ".join(f"{v['ShortName']}/{v['VolumeName']}" for v in vols), fg=GREEN)
+    return node_map
+
+
 # --- Tag-based OS-disk -> FA-volume map ----------------------------------------------------------------
 # At scale, resolving the node->volume map by SSH + SCSI serial on every snapshot/restore is slow. Instead
 # we precompute it once per topology change (initialize-protection-groups) and store it on the FA volumes

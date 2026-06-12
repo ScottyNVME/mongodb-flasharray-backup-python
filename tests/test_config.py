@@ -249,3 +249,38 @@ def test_parse_volume_map_tags_empty_and_missing_node():
     # deployment matches but no node tag -> skipped
     rows = [_TagRow("v1", config.VOLMAP_TAG_DEPLOYMENT, "dep")]
     assert config.parse_volume_map_tags(rows, "arr", "dep") == {}
+
+
+# --------------------------------------------------------------------------------------------------------
+# Multi-volume discovery parser (parse_fa_volume_serials) — pure, no live node.
+# --------------------------------------------------------------------------------------------------------
+def test_parse_fa_volume_serials_single_volume_prdm():
+    # lsblk -s -rno TYPE,NAME,SERIAL,WWN for /data/mongo on a single pRDM (/dev/sdb1 -> sdb).
+    out = (
+        "part sdb1\n"
+        "disk sdb 1071bf0a0a224a050019bf3b 0x624a93701071bf0a0a224a050019bf3b\n"
+    )
+    assert config.parse_fa_volume_serials(out) == ["1071bf0a0a224a050019bf3b"]
+
+
+def test_parse_fa_volume_serials_multivolume_lvm_multipath():
+    # LVM VG over two FA volumes, each a multipath device with two paths (modeled on the KVM customer:
+    # WWN 0x624a9370<serial> on the mpath dm; bare 24-hex SERIAL on each sd path; de-dup to 2 volumes).
+    out = (
+        "lvm  vg_database-lv_u01data\n"
+        "lvm  vg_database-lv_u01data\n"
+        "mpath mpatha  0x624a937033f4fcdef857436f000339e6\n"
+        "disk  sdc 33f4fcdef857436f000339e6\n"
+        "disk  sdd 33f4fcdef857436f000339e6\n"
+        "mpath mpathb  0x624a937033f4fcdef857436f000339e7\n"
+        "disk  sde 33f4fcdef857436f000339e7\n"
+    )
+    assert config.parse_fa_volume_serials(out) == [
+        "33f4fcdef857436f000339e6",
+        "33f4fcdef857436f000339e7",
+    ]
+
+
+def test_parse_fa_volume_serials_ignores_non_fa_rows_and_empties():
+    out = "lvm vg-lv\nvg  vg\ndisk sda ATA_SOMEDISK_123\n\n"
+    assert config.parse_fa_volume_serials(out) == []
