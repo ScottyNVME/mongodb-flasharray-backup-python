@@ -1033,8 +1033,16 @@ def resolve_node_volume_map(fa: Any, nodes: list[str], ssh_user_param: str, ssh_
 
     actual_serial: dict[str, dict[str, str]] = {}  # array -> {volume: SERIAL}
     if verify and tagged:
-        for ctx in {v["ShortName"] for vols in tagged.values() for v in vols}:
-            vols = _fa(fa.get_volumes(context_names=[ctx]), allow_error=True) or []
+        # Fetch ONLY the tagged volumes per array (names filter) — never an unfiltered get_volumes,
+        # which would pull every volume on a production array and make verify slower than SSH discovery.
+        names_by_ctx: dict[str, list] = {}
+        for vols in tagged.values():
+            for v in vols:
+                names = names_by_ctx.setdefault(v["ShortName"], [])
+                if v["VolumeName"] not in names:
+                    names.append(v["VolumeName"])
+        for ctx, names in names_by_ctx.items():
+            vols = _fa(fa.get_volumes(names=names, context_names=[ctx]), allow_error=True) or []
             actual_serial[ctx] = {getattr(v, "name", None): (getattr(v, "serial", "") or "") for v in vols}
 
     for node in nodes:
