@@ -293,7 +293,20 @@ Tags `ClusterName`, `BackupTimestamp`, and `BackupType` are written inline at cr
 
 ## Node-to-Volume Discovery
 
-**Fast path (default): FlashArray volume tags.** Resolving the storage path per node on *every* snapshot/restore by SSH is slow at scale. `initialize-protection-groups` therefore precomputes the map once and writes it onto each FA volume as **copyable `mongo:` tags** — `deployment`, `node`, `mountpoint`, `serial`, `vg`, `pvindex`. On the hot path, `resolve_node_volume_map` reads those tags (one `GET /volumes/tags` per array, **no SSH**), cross-checks each volume's serial against the array, and falls back to live discovery only for an untagged or stale node. **Re-run `initialize-protection-groups` after any topology change** (node/shard add or remove) to refresh the tags. (With no tags present the resolver degrades to full live discovery, so it stays correct out of the box.)
+**Fast path (default): FlashArray volume tags.** Resolving the storage path per node on *every* snapshot/restore by SSH is slow at scale. `initialize-protection-groups` therefore precomputes the map once and writes it onto each FA volume as **copyable `mongo:` tags** — `deployment`, `node`, `mountpoint`, `serial`, `vg`, `pvindex`, `pvcount`. On the hot path, `resolve_node_volume_map` reads those tags (one `GET /volumes/tags` per array, **no SSH**), cross-checks each volume's serial against the array, and falls back to live discovery only for an untagged or stale node. **Re-run `initialize-protection-groups` after any topology change** (node/shard add or remove) to refresh the tags. (With no tags present the resolver degrades to full live discovery, so it stays correct out of the box.)
+
+### What happens when a volume moves between arrays
+
+The map is keyed on the **SCSI serial**, and the array a volume lives on is *derived* (which array's `GET /volumes/tags` returned it), never hard-coded — so an array-to-array move resolves correctly through one of three paths, and the failure modes are all **loud, never silent corruption**:
+
+| Situation after the move | What the resolver does |
+|---|---|
+| Tags travelled with the volume; new array is in the PG set | Read from the new array → `ShortName` is the new array → serial matches → **used directly.** Self-correcting. |
+| Tag lost, or serial changed, or a stale tag left on the old array | Serial cross-check fails (or the node is untagged) → **falls back to live SSH discovery** for that node, which re-finds the volume by serial on whichever PG array now owns it. |
+| One PV of a multi-volume (LVM) node lost its tag | `mongo:pvcount` says the node should have *N* volumes but fewer resolved → **flagged incomplete → full SSH rediscovery** (without this guard the missing PV would be silently dropped, producing a partial backup). |
+| Volume moved to an array with **no protection group** | SSH discovery searches only PG arrays, finds nothing, and **raises** — restore/snapshot abort before any change. Fix: re-run `initialize-protection-groups` so the destination array joins the PG, then retry. |
+
+Restore adds defence-in-depth on top of resolution: it confirms the resolved volume **count** equals the snapshot's recorded `mongo:volumes` count, that each per-volume member snapshot **exists** on the resolved array, and that **sizes match** — all *before* the destructive overwrite. So a moved volume yields either a correct restore or a clean abort, never a wrong-volume overwrite.
 
 **Discovery chain (runs at tag time, and as the fallback).** `discover_node_volumes` walks each node's data mount to *all* its backing FA volumes, returning `node -> [volumes]` — one entry for a single pRDM, several for an **LVM/multipath** mount whose VG spans multiple PVs. For a direct device it is the five steps below; for LVM it walks the inverse device tree (`lsblk -s`: mount → LV → VG → PVs → multipath) and reads each volume's serial from the SERIAL column (24-hex) or the NAA WWN (`0x624a9370<serial>`), de-duplicating multiple paths to the same volume. The original single-device chain (`resolve_node_to_array_volume_map`) has five steps:
 
