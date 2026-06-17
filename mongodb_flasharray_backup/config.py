@@ -947,6 +947,9 @@ VOLMAP_TAG_MOUNT = "mongo:mountpoint"
 VOLMAP_TAG_SERIAL = "mongo:serial"
 VOLMAP_TAG_VG = "mongo:vg"            # LVM volume group (empty for a direct device); for multi-volume nodes
 VOLMAP_TAG_PVINDEX = "mongo:pvindex"  # ordinal of this volume within its VG (0 for single-volume)
+VOLMAP_TAG_PVCOUNT = "mongo:pvcount"  # total volumes backing this node's mount; lets the resolver detect a
+                                      # missing volume (e.g. a PV that moved arrays/lost its tag) and refuse
+                                      # to act on an incomplete set instead of silently skipping a volume
 
 
 def write_volume_map_tags(fa: Any, deployment: Optional[str], node_map: dict, mountpoint: str = MONGO_DATA_MOUNT) -> int:
@@ -956,6 +959,8 @@ def write_volume_map_tags(fa: Any, deployment: Optional[str], node_map: dict, mo
     dep = deployment or ""
     n = 0
     for node, vols in node_map.items():
+        pvcount = len(vols)  # how many volumes back this node's mount; stored on each so the resolver can
+                             # detect (and refuse) an incomplete set rather than silently dropping a volume
         for info in vols:
             tags = [
                 {"key": VOLMAP_TAG_DEPLOYMENT, "value": dep, "copyable": True},
@@ -964,6 +969,7 @@ def write_volume_map_tags(fa: Any, deployment: Optional[str], node_map: dict, mo
                 {"key": VOLMAP_TAG_SERIAL, "value": info.get("Serial", ""), "copyable": True},
                 {"key": VOLMAP_TAG_VG, "value": info.get("Vg", ""), "copyable": True},
                 {"key": VOLMAP_TAG_PVINDEX, "value": str(info.get("PvIndex", 0)), "copyable": True},
+                {"key": VOLMAP_TAG_PVCOUNT, "value": str(pvcount), "copyable": True},
             ]
             _fa(fa.put_volumes_tags_batch(resource_names=[info["VolumeName"]], tag=tags,
                                           context_names=[info["ShortName"]]))
@@ -998,9 +1004,16 @@ def parse_volume_map_tags(tag_rows: list, ctx_name: str, deployment: Optional[st
             pvindex = int(kv.get(VOLMAP_TAG_PVINDEX) or 0)
         except (TypeError, ValueError):
             pvindex = 0
+        # PvCount is None when the tag is absent (older tags) so the completeness guard simply skips —
+        # backward-compatible; re-running initialize-protection-groups stamps it and enables the guard.
+        pvcount_raw = kv.get(VOLMAP_TAG_PVCOUNT)
+        try:
+            pvcount = int(pvcount_raw) if pvcount_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            pvcount = None
         out.setdefault(node, []).append({
             "ShortName": ctx_name, "VolumeName": vol,
-            "Serial": (kv.get(VOLMAP_TAG_SERIAL) or ""), "PvIndex": pvindex,
+            "Serial": (kv.get(VOLMAP_TAG_SERIAL) or ""), "PvIndex": pvindex, "PvCount": pvcount,
         })
     return out
 
@@ -1061,6 +1074,16 @@ def resolve_node_volume_map(fa: Any, nodes: list[str], ssh_user_param: str, ssh_
                                f"(serial {v['Serial']} != {got or 'none'}) - rediscovering", fg=YELLOW)
                     stale = True
                     break
+        # Completeness guard (no API cost, runs regardless of verify): if the tags record how many volumes
+        # this node should have (mongo:pvcount) and fewer resolved, a volume's tag is missing -- e.g. a PV
+        # that moved to an array outside the current PG set, or lost its tag on an array-to-array move.
+        # Rediscover via SSH rather than snapshot/restore a silently incomplete (and thus corrupt) set.
+        if not stale:
+            want = next((v["PvCount"] for v in vols if v.get("PvCount")), None)
+            if want is not None and want != len(vols):
+                write_host(f"    volume-map tags incomplete for {node} ({len(vols)} of {want} volume(s) "
+                           "found) - rediscovering", fg=YELLOW)
+                stale = True
         if stale:
             fallback_nodes.append(node)
             continue

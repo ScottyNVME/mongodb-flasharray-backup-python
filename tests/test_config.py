@@ -241,6 +241,7 @@ def test_parse_volume_map_tags_groups_and_filters_by_deployment():
             "VolumeName": "aen-mongo-01-data",
             "Serial": "1071bf0a0a224a050019bf3b",
             "PvIndex": 0,
+            "PvCount": None,  # no mongo:pvcount tag in these rows -> guard skipped (backward compatible)
         }]
     }
 
@@ -250,6 +251,82 @@ def test_parse_volume_map_tags_empty_and_missing_node():
     # deployment matches but no node tag -> skipped
     rows = [_TagRow("v1", config.VOLMAP_TAG_DEPLOYMENT, "dep")]
     assert config.parse_volume_map_tags(rows, "arr", "dep") == {}
+
+
+def test_parse_volume_map_tags_captures_pvcount():
+    rows = [
+        _TagRow("v0", config.VOLMAP_TAG_DEPLOYMENT, "dep"),
+        _TagRow("v0", config.VOLMAP_TAG_NODE, "nodeA"),
+        _TagRow("v0", config.VOLMAP_TAG_PVINDEX, "0"),
+        _TagRow("v0", config.VOLMAP_TAG_PVCOUNT, "2"),
+    ]
+    m = config.parse_volume_map_tags(rows, "arr", "dep")
+    assert m["nodeA"][0]["PvCount"] == 2
+
+
+# --------------------------------------------------------------------------------------------------------
+# Completeness guard in resolve_node_volume_map: a node tagged with mongo:pvcount=N but resolving to fewer
+# than N volumes (a PV's tag is missing) must fall back to live SSH discovery, never act on a partial set.
+# --------------------------------------------------------------------------------------------------------
+def test_resolve_node_volume_map_rediscovers_incomplete_node(monkeypatch):
+    # Tags report nodeA with 2 volumes but pvcount=3 (one PV's tag missing) -> must rediscover via SSH.
+    tagged = {"nodeA": [
+        {"ShortName": "arrX", "VolumeName": "volA0", "Serial": "", "PvIndex": 0, "PvCount": 3},
+        {"ShortName": "arrX", "VolumeName": "volA1", "Serial": "", "PvIndex": 1, "PvCount": 3},
+    ]}
+    monkeypatch.setattr(config, "read_volume_map_tags", lambda *a, **k: tagged)
+    discovered = {"nodeA": [
+        {"ShortName": "arrX", "VolumeName": "volA0", "Serial": "s0", "PvIndex": 0},
+        {"ShortName": "arrX", "VolumeName": "volA1", "Serial": "s1", "PvIndex": 1},
+        {"ShortName": "arrY", "VolumeName": "volA2", "Serial": "s2", "PvIndex": 2},
+    ]}
+    called = {}
+
+    def fake_discover(fa, nodes, *a, **k):
+        called["nodes"] = list(nodes)
+        return {n: discovered[n] for n in nodes}
+
+    monkeypatch.setattr(config, "discover_node_volumes", fake_discover)
+    monkeypatch.setattr(config, "_fa", lambda resp, allow_error=False: resp)
+
+    class _FakeFA:
+        def get_volumes(self, names=None, context_names=None):
+            return []  # serials are "" so the verify comparison is skipped; this just feeds actual_serial
+
+    out = config.resolve_node_volume_map(
+        _FakeFA(), ["nodeA"], "u", config.SSH_OPTS, ["arrX", "arrY"], "dep"
+    )
+    assert called["nodes"] == ["nodeA"]   # incomplete node routed to SSH discovery
+    assert out == discovered              # final map is the complete, rediscovered set
+
+
+def test_resolve_node_volume_map_complete_node_uses_tags(monkeypatch):
+    # pvcount=2 and 2 volumes resolve with matching serials -> trust tags, never fall back.
+    tagged = {"nodeA": [
+        {"ShortName": "arrX", "VolumeName": "volA0", "Serial": "aa", "PvIndex": 0, "PvCount": 2},
+        {"ShortName": "arrX", "VolumeName": "volA1", "Serial": "bb", "PvIndex": 1, "PvCount": 2},
+    ]}
+    monkeypatch.setattr(config, "read_volume_map_tags", lambda *a, **k: tagged)
+
+    def boom(*a, **k):
+        raise AssertionError("must not fall back when the tag set is complete and serials match")
+
+    monkeypatch.setattr(config, "discover_node_volumes", boom)
+    monkeypatch.setattr(config, "_fa", lambda resp, allow_error=False: resp)
+
+    class _V:
+        def __init__(self, n, s):
+            self.name, self.serial = n, s
+
+    class _FakeFA:
+        def get_volumes(self, names=None, context_names=None):
+            return [_V("volA0", "AA"), _V("volA1", "BB")]  # FA stores uppercase; resolver lowercases
+
+    out = config.resolve_node_volume_map(_FakeFA(), ["nodeA"], "u", config.SSH_OPTS, ["arrX"], "dep")
+    assert out == {"nodeA": [
+        {"ShortName": "arrX", "VolumeName": "volA0", "Serial": "aa", "PvIndex": 0},
+        {"ShortName": "arrX", "VolumeName": "volA1", "Serial": "bb", "PvIndex": 1},
+    ]}
 
 
 # --------------------------------------------------------------------------------------------------------
