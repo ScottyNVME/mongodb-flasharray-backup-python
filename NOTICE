@@ -1,5 +1,0 @@
-mongodb-flasharray-backup (Python)
-
-A Python 3.11+ port of https://github.com/nocentino/mongodb-flasharray-backup
-(Copyright the original authors, Apache License 2.0). This derivative work is
-also distributed under the Apache License 2.0; see LICENSE.
