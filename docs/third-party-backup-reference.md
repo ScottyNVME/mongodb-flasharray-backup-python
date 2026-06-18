@@ -397,11 +397,11 @@ OM does not automatically start tailing another node. The client must select a n
 
 **Full Snapshot Restore — Non-Incremental**
 - [x] Self Restore Replica Set — ✅ validated on `aen-rs-00` (drift 0, point-in-time fidelity proof)
-- [ ] Restore Replica Set to different Replica Set — ❌ in-place self-restore only
+- [ ] Restore Replica Set to different Replica Set — 🟡 implemented as `restore-mongo-snapshot-to-target` (cert 1.A.1.b; seed + initial-sync, same arrays); unit-tested, not yet live-validated
 - [ ] Restore Replica Set to different Ops Manager — ❌
 
 **PIT Restore — Non-Incremental**
-- [ ] PIT Restore Replica Set to self — 🟡 supported; needs the `replicaset` branch in tailer/replay
+- [x] PIT Restore Replica Set to self — ✅ validated on `aen-rs-00` (cert 1.B.1.a; oplog replay to a target ts, `unrecoveredTail=0`)
 - [ ] Restore Replica Set to different Replica Set
 - [ ] Restore Replica Set with Encryption at Rest to different Replica Set
 - [ ] PIT Restore Replica Set to different Replica Set with Arbiter

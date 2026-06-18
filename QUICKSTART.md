@@ -16,9 +16,9 @@ project? Start here, then see [README.md](README.md) for full command reference 
 
 You need all of these in place first (one-time, usually by an admin):
 
-- [ ] **A MongoDB 8.0 sharded cluster *or* standalone replica set** managed by **Ops Manager 8.0**, one data
-      volume per node mounted at `/data/mongo` (no LVM), each volume on a **FlashArray** enrolled in the same
-      **Pure Storage Fusion fleet**.
+- [ ] **A MongoDB 8.0 sharded cluster *or* standalone replica set** managed by **Ops Manager 8.0**, with
+      `/data/mongo` on a **FlashArray** volume (single direct pRDM is the validated layout; LVM-over-multipath
+      is supported but not yet live-validated) — every array enrolled in the same **Pure Storage Fusion fleet**.
 - [ ] **Ops Manager third-party backup enabled** and the cluster **registered / `ACTIVE`**
       (see [docs/third-party-backup-reference.md](docs/third-party-backup-reference.md), Steps 1–7). *For a
       replica set, register it via the third-party `…/clusters/{id}/manage` endpoint — no OM snapshot store is

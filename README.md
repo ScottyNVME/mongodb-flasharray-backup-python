@@ -36,7 +36,7 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-This installs the dependencies (`python-dotenv`, `requests`, `typer`) and the ten console scripts listed below.
+This installs the dependencies (`python-dotenv`, `requests`, `typer`) and the eleven console scripts listed below.
 
 > **SSH multiplexing.** All remote commands shell out to the system `ssh`/`scp` with ControlMaster options
 > (`ControlPath=/tmp/ssh-mux-%C`, `ControlPersist=60s`) to avoid saturating `sshd`'s `MaxStartups`. No Python
@@ -97,21 +97,25 @@ See [.env.example](.env.example) for a worked two-deployment example.
   snapshots). The standard `backupConfigs statusName=STARTED` path is OM-managed backup and will 409
   `Could not find available Snapshot Store`.
 - Protection groups initialized on all FlashArrays (`initialize-protection-groups`, run per deployment).
-- A single data volume per node mounted at `/data/mongo` (no LVM) — the validated layout.
+- A data volume per node mounted at `/data/mongo`. A single direct volume (pRDM) is the **live-validated**
+  layout; LVM-over-multipath (a VG spanning several FlashArray volumes) is **supported** by discovery, tagging
+  and restore but is not yet validated on live hardware.
 
 ---
 
 ## Commands
 
-Run `<command> --help` for full option details. `new-mongo-snapshot`, `restore-mongo-snapshot`, and
-`initialize-protection-groups` accept **`--deployment <name>`** to select a deployment from the `.env` (omit for
-the default/flat deployment).
+Run `<command> --help` for full option details. The deployment-aware commands — `new-mongo-snapshot`,
+`restore-mongo-snapshot`, `restore-mongo-snapshot-to-target`, `initialize-protection-groups`,
+`start-oplog-tailer`, `stop-oplog-tailer`, and `invoke-oplog-replay` — accept **`--deployment <name>`** to select
+a deployment from the `.env` (omit for the default/flat deployment).
 
 | Command | Purpose |
 |---|---|
 | `initialize-protection-groups` | Create the PG on every fleet array and add data volumes. `--what-if`, `--prune`, `--force`. |
 | `new-mongo-snapshot` | Take a crash-consistent FlashArray PG snapshot across all nodes via the backup-cursor window. `--snapshot-tag`, `--baseline-database`, `--baseline-collections`. |
 | `restore-mongo-snapshot` | Destructive in-place restore from a snapshot tag. Verifies baseline counts; **sharded restores also verify per-shard data distribution** (each shard's RS counted directly, sums account for the mongos aggregate). `--snapshot-tag` (required), `--force`, `--verify-database`, `--skip-verification`. |
+| `restore-mongo-snapshot-to-target` | Cross-cluster restore of a replica-set snapshot to a **different** replica set (seed + initial-sync; seed's volume must be on the same array as the source snapshot). `--snapshot-tag` (required), `--target-nodes`, `--target-rs-name`, `--target-seed`, `--target-member-port`, `--deployment`, `--force`. |
 | `remove-old-artifacts` | Retention cleanup of old FA snapshots + local oplog/log dirs. `--older-than-days` (required, 1–365), `--what-if`. |
 | `start-oplog-tailer` | Continuously capture oplog `.oplogs` segments for PITR. `--snapshot-tag`, `--interval-sec`, `--timeout-minutes`, `--poll-interval-sec`, `--abort-on-gap`. |
 | `stop-oplog-tailer` | Stop the tailer (`.stop` sentinel) and capture the T2 mark. `--snapshot-tag`, `--wait-sec`, `--baseline-database`, `--baseline-collections`. |
