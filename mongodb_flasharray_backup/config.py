@@ -950,6 +950,8 @@ VOLMAP_TAG_PVINDEX = "mongo:pvindex"  # ordinal of this volume within its VG (0 
 VOLMAP_TAG_PVCOUNT = "mongo:pvcount"  # total volumes backing this node's mount; lets the resolver detect a
                                       # missing volume (e.g. a PV that moved arrays/lost its tag) and refuse
                                       # to act on an incomplete set instead of silently skipping a volume
+VOLMAP_TAG_RS = "mongo:rs"            # replica-set id this member belongs to (Path A replication wiring)
+VOLMAP_TAG_REPLPG = "mongo:replpg"    # this member's replication PG (Path A: fans its snapshot to siblings)
 
 
 def write_volume_map_tags(fa: Any, deployment: Optional[str], node_map: dict, mountpoint: str = MONGO_DATA_MOUNT) -> int:
@@ -1098,6 +1100,90 @@ def resolve_node_volume_map(fa: Any, nodes: list[str], ssh_user_param: str, ssh_
                    fg=DARK_YELLOW)
         resolved.update(discover_node_volumes(fa, fallback_nodes, ssh_user_param, ssh_opts_param, context_names))
     return resolved
+
+
+# endregion
+
+# region --- Path A: replica-set replication wiring (per-member repl-PGs + async mesh) -----------------
+# Path A makes in-place restore consistent-by-construction: every member of an RS is restored from the ONE
+# OM-frozen secondary's snapshot, pre-replicated at snapshot time to the arrays hosting that RS's other
+# members. That requires, per RS, a per-member replication PG whose targets are the sibling-member arrays,
+# and a COMPLETE async-replication mesh among those arrays. See docs/path-a-implementation-plan.md.
+REPL_PG_SUFFIX = "-repl"
+
+
+def repl_pg_name(volume_name: str) -> str:
+    """Per-member replication PG name for a data volume: holds that one member's volume and replicates it
+    to the arrays hosting the RS's OTHER members."""
+    return f"{volume_name}{REPL_PG_SUFFIX}"
+
+
+def get_replica_set_membership(cluster_nodes: list[str]) -> dict[str, list[str]]:
+    """Return rs_id -> [node hostnames] from the OM cluster detail. For a standalone replica set
+    (TOPOLOGY=replicaset) with OM unreachable, every node is one RS, so fall back to a single group.
+    Raises for a sharded cluster when OM is unavailable (shard grouping cannot be inferred)."""
+    try:
+        detail = invoke_om_api(path=f"group/{CFG.GroupId}/clusters/{CFG.ClusterId}")
+        membership: dict[str, list[str]] = {}
+        for rs in detail.get("replicaSets") or []:
+            rid = rs.get("id")
+            for n in rs.get("nodes") or []:
+                host = n.get("hostname")
+                if rid and host:
+                    membership.setdefault(rid, []).append(host)
+        if membership:
+            return membership
+    except Exception as e:  # noqa: BLE001 - OM optional for a standalone RS
+        write_host(f"  WARNING: OM RS-membership lookup failed ({e}).", fg=YELLOW)
+    if (CFG.Topology or "").lower() == "replicaset":
+        rid = CFG.DeploymentName or "replicaset"
+        write_host(f"  Using single-RS fallback ({len(cluster_nodes)} node(s)) for '{rid}'.", fg=DARK_YELLOW)
+        return {rid: list(cluster_nodes)}
+    raise RuntimeError(
+        "Cannot determine replica-set membership: Ops Manager cluster detail is unavailable and TOPOLOGY "
+        "is not 'replicaset'. RS grouping is required to wire replication on a sharded cluster."
+    )
+
+
+def build_rs_array_map(rs_membership: dict, node_volume_map: dict) -> dict:
+    """Pure. rs_id -> [ {'Node','VolumeName','ShortName'} ] for members present in node_volume_map (a
+    node's volumes each become an entry; a single-volume member yields one)."""
+    out: dict[str, list] = {}
+    for rid, hosts in rs_membership.items():
+        for host in hosts:
+            for entry in node_volume_map.get(host, []):
+                out.setdefault(rid, []).append(
+                    {"Node": host, "VolumeName": entry["VolumeName"], "ShortName": entry["ShortName"]}
+                )
+    return out
+
+
+def missing_async_mesh_links(rs_array_map: dict, connected_pairs: set) -> list[dict]:
+    """Pure. For each RS, every DISTINCT pair of member arrays lacking an async-replication connection
+    (connected_pairs = set of frozenset({a,b})). Returns [{'Rs','ArrayA','ArrayB'}]."""
+    missing: list[dict] = []
+    for rid, entries in rs_array_map.items():
+        arrays = sorted({e["ShortName"] for e in entries})
+        for i in range(len(arrays)):
+            for j in range(i + 1, len(arrays)):
+                if frozenset((arrays[i], arrays[j])) not in connected_pairs:
+                    missing.append({"Rs": rid, "ArrayA": arrays[i], "ArrayB": arrays[j]})
+    return missing
+
+
+def async_replication_pairs(fa: Any, arrays: list[str]) -> set:
+    """Live. Set of frozenset({a,b}) array pairs with a CONNECTED async-replication connection. Reads each
+    array's array-connections (the routed GET is per-array; only connection-key is not gateway-routed)."""
+    pairs: set = set()
+    for arr in arrays:
+        for c in _fa(fa.get_array_connections(context_names=[arr]), allow_error=True) or []:
+            if getattr(c, "type", None) != "async-replication" or getattr(c, "status", None) != "connected":
+                continue
+            remote = getattr(c, "remote", None)
+            rname = getattr(remote, "name", None) if remote is not None else None
+            if rname:
+                pairs.add(frozenset((arr, rname)))
+    return pairs
 
 
 # endregion

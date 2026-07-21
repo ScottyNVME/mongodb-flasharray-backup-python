@@ -330,6 +330,59 @@ def test_resolve_node_volume_map_complete_node_uses_tags(monkeypatch):
 
 
 # --------------------------------------------------------------------------------------------------------
+# Path A replication wiring helpers (pure logic; RS grouping + async mesh gap detection).
+# --------------------------------------------------------------------------------------------------------
+def test_repl_pg_name():
+    assert config.repl_pg_name("aen-mongo-05-data") == "aen-mongo-05-data-repl"
+
+
+def test_build_rs_array_map_groups_members_by_rs():
+    rs_membership = {"rs0": ["n1", "n2", "n3"]}
+    node_volume_map = {
+        "n1": [{"VolumeName": "v1", "ShortName": "arrA", "Serial": "s1", "PvIndex": 0}],
+        "n2": [{"VolumeName": "v2", "ShortName": "arrB", "Serial": "s2", "PvIndex": 0}],
+        "n3": [{"VolumeName": "v3", "ShortName": "arrC", "Serial": "s3", "PvIndex": 0}],
+    }
+    m = config.build_rs_array_map(rs_membership, node_volume_map)
+    assert m == {"rs0": [
+        {"Node": "n1", "VolumeName": "v1", "ShortName": "arrA"},
+        {"Node": "n2", "VolumeName": "v2", "ShortName": "arrB"},
+        {"Node": "n3", "VolumeName": "v3", "ShortName": "arrC"},
+    ]}
+
+
+def test_missing_async_mesh_links_flags_the_gap():
+    # 3-member RS on arrA/arrB/arrC; only arrA<->arrB and arrA<->arrC are connected -> arrB<->arrC missing.
+    rs_array_map = {"rs0": [
+        {"Node": "n1", "VolumeName": "v1", "ShortName": "arrA"},
+        {"Node": "n2", "VolumeName": "v2", "ShortName": "arrB"},
+        {"Node": "n3", "VolumeName": "v3", "ShortName": "arrC"},
+    ]}
+    connected = {frozenset(("arrA", "arrB")), frozenset(("arrA", "arrC"))}
+    assert config.missing_async_mesh_links(rs_array_map, connected) == [
+        {"Rs": "rs0", "ArrayA": "arrB", "ArrayB": "arrC"}
+    ]
+
+
+def test_missing_async_mesh_links_complete_mesh_is_empty():
+    rs_array_map = {"rs0": [
+        {"Node": "n1", "VolumeName": "v1", "ShortName": "arrA"},
+        {"Node": "n2", "VolumeName": "v2", "ShortName": "arrB"},
+    ]}
+    connected = {frozenset(("arrA", "arrB"))}
+    assert config.missing_async_mesh_links(rs_array_map, connected) == []
+
+
+def test_missing_async_mesh_links_single_array_rs_needs_no_links():
+    # All members on one array (single-array RS) -> no inter-array links required.
+    rs_array_map = {"rs0": [
+        {"Node": "n1", "VolumeName": "v1", "ShortName": "arrA"},
+        {"Node": "n2", "VolumeName": "v2", "ShortName": "arrA"},
+    ]}
+    assert config.missing_async_mesh_links(rs_array_map, set()) == []
+
+
+# --------------------------------------------------------------------------------------------------------
 # Multi-volume discovery parser (parse_fa_volume_serials) — pure, no live node.
 # --------------------------------------------------------------------------------------------------------
 def test_parse_fa_volume_serials_single_volume_prdm():
