@@ -382,6 +382,22 @@ def test_missing_async_mesh_links_single_array_rs_needs_no_links():
     assert config.missing_async_mesh_links(rs_array_map, set()) == []
 
 
+def test_build_frozen_source_list_targets_are_sibling_arrays():
+    # The frozen member (n2 on arrB) is the source; targets = the RS's other member arrays (arrA, arrC).
+    frozen_members = [{"Rs": "rs0", "NodeId": "n2:27017"}]
+    rs_array_map = {"rs0": [
+        {"Node": "n1", "VolumeName": "v1", "ShortName": "arrA"},
+        {"Node": "n2", "VolumeName": "v2", "ShortName": "arrB"},
+        {"Node": "n3", "VolumeName": "v3", "ShortName": "arrC"},
+    ]}
+    node_volume_map = {"n2": [{"VolumeName": "v2", "ShortName": "arrB", "Serial": "s2", "PvIndex": 0}]}
+    out = config.build_frozen_source_list(frozen_members, rs_array_map, node_volume_map)
+    assert out == [{
+        "Rs": "rs0", "Host": "n2", "VolumeName": "v2", "ShortName": "arrB",
+        "ReplPg": "v2-repl", "Targets": ["arrA", "arrC"],
+    }]
+
+
 # --------------------------------------------------------------------------------------------------------
 # Multi-volume discovery parser (parse_fa_volume_serials) — pure, no live node.
 # --------------------------------------------------------------------------------------------------------

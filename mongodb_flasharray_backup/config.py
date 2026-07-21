@@ -1186,4 +1186,49 @@ def async_replication_pairs(fa: Any, arrays: list[str]) -> set:
     return pairs
 
 
+def build_frozen_source_list(frozen_members: list, rs_array_map: dict, node_volume_map: dict) -> list:
+    """Pure. For each OM-frozen member (the backup-cursor node, one per RS), the volume(s) that are the
+    single consistent restore source and where to replicate them. Returns
+    [{'Rs','Host','VolumeName','ShortName','ReplPg','Targets'}] (one per frozen-member volume); Targets =
+    the RS's OTHER member arrays. frozen_members = [{'Rs','NodeId'}] (NodeId is host:port)."""
+    out: list = []
+    for fm in frozen_members:
+        rs = fm.get("Rs")
+        host = (fm.get("NodeId") or "").split(":")[0]
+        member_arrays = sorted({e["ShortName"] for e in rs_array_map.get(rs, [])})
+        for entry in node_volume_map.get(host, []):
+            arr = entry["ShortName"]
+            out.append({
+                "Rs": rs, "Host": host, "VolumeName": entry["VolumeName"], "ShortName": arr,
+                "ReplPg": repl_pg_name(entry["VolumeName"]),
+                "Targets": [a for a in member_arrays if a != arr],
+            })
+    return out
+
+
+def wait_replicated_snapshot(fa: Any, source_array: str, repl_pg: str, suffix: str, target_arrays: list[str],
+                             timeout_sec: int = 900, poll_sec: int = 5) -> None:
+    """Block until the replicated PG snapshot '<source_array>:<repl_pg>.<suffix>' is present on EVERY target
+    array (Path A: the frozen secondary's snapshot must be local on each sibling-member array before the
+    snapshot run is considered restore-ready). Raises on timeout."""
+    remote_name = f"{source_array}:{repl_pg}.{suffix}"
+    pending = set(target_arrays)
+    deadline = time.time() + timeout_sec
+    while pending:
+        for tgt in list(pending):
+            snaps = _fa(fa.get_protection_group_snapshots(names=[remote_name], context_names=[tgt]),
+                        allow_error=True)
+            if snaps:
+                pending.discard(tgt)
+                write_host(f"      replicated to {tgt}", fg=GREEN)
+        if not pending:
+            return
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"Timed out after {timeout_sec}s waiting for '{remote_name}' to replicate to: "
+                f"{', '.join(sorted(pending))}. Check the async-replication link(s) and throttle."
+            )
+        time.sleep(poll_sec)
+
+
 # endregion
