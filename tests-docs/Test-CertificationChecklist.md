@@ -7,10 +7,11 @@ implementation, how to run it, and current status. Detailed step-by-step procedu
 [Test-FailoverAndCompliance.md](Test-FailoverAndCompliance.md) (failover / verification); recorded results live
 alongside in the `*-Results.md` files.
 
-> **Re-validation run 2026-07-22** (build `5c29659`, post Path-A revert): 1.A.1.a (RS self-restore) and 2.A.a
-> (sharded self-restore) re-passed live with drift 0 + sentinel-gone fidelity proofs; both PIT tests
-> (1.B.1.a, 2.B.e) are currently **blocked by a stale oplog stream** from the ~5-week OM outage (needs a
-> skip-forward re-baseline). Details in [Test-Certification-Results-2026-07-22.md](Test-Certification-Results-2026-07-22.md).
+> **Re-validation run 2026-07-22** (build `5c29659`, post Path-A revert): **1.A.1.a**, **2.A.a**, and **1.B.1.a**
+> re-passed live (drift 0 / sentinel-gone / `unrecoveredTail=0`). PIT needed a **skip-forward re-baseline** of
+> the OM oplog cursor (stale from the ~5-week OM outage — the stream itself was continuous). **2.B.e (sharded
+> PIT) is blocked** on a one-liner: `packer` must join the `mongod` group on `aen-mongo-config-00` (oplog `scp`
+> perms). Details in [Test-Certification-Results-2026-07-22.md](Test-Certification-Results-2026-07-22.md).
 
 ## Test Summary
 

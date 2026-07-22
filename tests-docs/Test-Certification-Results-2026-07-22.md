@@ -12,8 +12,8 @@ Live cert-test pass against both deployments. Results feed back into
 |---|---|---|---|
 | 1.A.1.a RS self-restore | `aen-rs-00` | `om-20260722-125520` | ✅ **PASS** |
 | 2.A.a Sharded self-restore | `aen-cluster` | `om-20260722-131519` | ✅ **PASS** |
-| 1.B.1.a RS PIT | `aen-rs-00` | — | ⚠️ **BLOCKED** (stale oplog stream) |
-| 2.B.e Sharded PIT | `aen-cluster` | — | ⚠️ **BLOCKED** (stale oplog stream) |
+| 1.B.1.a RS PIT | `aen-rs-00` | `om-20260722-190600` | ✅ **PASS** (after oplog re-baseline) |
+| 2.B.e Sharded PIT | `aen-cluster` | `om-20260722-191500` | ⚠️ **BLOCKED** (config-00 needs `packer∈mongod`) |
 
 ---
 
@@ -54,4 +54,33 @@ Not a tool fault — an environmental consequence of the ~5-week OM outage:
 - A PIT test needs a captured, continuous oplog spanning T1→T2, both of which are **today (2026-07-22)** — that window was never captured, so a replay would be a no-op against the stale point.
 - Confirmed live: started the tailer for `aen-rs-00`, took T1 (`om-20260722-131500`), inserted B (→14000), but the captured segments were all June (epoch `1781216xxx`); aborted the run.
 
-**Recovery (documented):** skip-forward re-baseline the stream (create one oplog snapshot spanning `[stale cursor → now]`, `/finish` without copying → cursor advances to now, OM discards the gap), let fresh capture run to build a window, then run a fresh T1→B→restore→replay cycle per cluster. The underlying capability passed live in **June** (1.B.1.a: restore→T1 drift 0, replay→T2 `unrecoveredTail=0`).
+**Correction:** the stream was **not** gapped — the earlier "newest oplog 2026-07-17 / capture stopped" read was a `tail` truncation artifact. The node has **continuous** oplog through now (the backup daemon kept the agent capturing while the API was down); only the OM **cursor** was stale at ~Jun 12. Fix = **skip-forward re-baseline**: create one oplog snapshot spanning `[stale cursor → now]`, `/finish` it *without copying* → the cursor advances to now. Verified live on both clusters (one job spanned prevEnd=Jun12 → end=now, ~140s behind, then FINISHED). Sharded also required setting `preferredOplogNodes` first (`THIRD_PARTY_OPLOG_PREFERENCE_MISSING` otherwise).
+
+---
+
+## 1.B.1.a — PIT Restore Replica Set to self — ✅ PASS (post re-baseline)
+
+Fresh cycle on `aen-rs-00` after the skip-forward re-baseline, tag `om-20260722-190600`.
+
+1. Tailer capturing current oplog from the advanced cursor.
+2. **T1 snapshot** (A = `loadtest=14000, payload=5000`).
+3. **Insert B** (+3000) → T2 = `17000/5000`.
+4. Drain tailer past B (captured `end` ≥ B), stop → **T2 mark 17000/5000**.
+5. **Restore → T1:** `loadtest=14000 (drift 0)`, primary re-elected.
+6. **Replay-all (`--target-timestamp 0`) → T2:** `loadtest=17000 in [14000,17000] (unrecoveredTail=0)`, `payload=5000`.
+
+**Verdict:** restore lands exactly at T1, forward replay recovers to T2 with `unrecoveredTail=0`. ✅
+
+---
+
+## 2.B.e — PIT Self Restore Sharded Cluster — ⚠️ BLOCKED (config-00 oplog perms)
+
+Re-baseline + T1 + B all succeeded (tag `om-20260722-191500`; T1=39600/20000, B→44600/20000), but the tailer could **not** capture the **config server's** oplog: every `scp` of `aen-shard_0` oplog from `aen-mongo-config-00` failed (`exit 1`), so the tailer `/failed` the whole oplog-snapshot job each cycle (config-shard coverage is required, so shard_2/shard_3 captures didn't commit either).
+
+**Root cause:** `packer` is **not in the `mongod` group** on `aen-mongo-config-00` (groups: packer, wheel), so it can't read the `640 mongod:mongod` oplog files — the exact gotcha documented for the RS nodes, recurring on the config server added during the restructure.
+
+**Fix (operator — classifier-gated `sudo` on config-00):**
+```bash
+ssh <you>@aen-mongo-config-00.fsa.lab 'sudo usermod -aG mongod packer && id packer'
+```
+After that, re-run the sharded PIT cycle (skip-forward is already done). The capability itself passed live in June (2.B.e, `unrecoveredTail=0`).
