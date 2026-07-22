@@ -7,6 +7,11 @@ implementation, how to run it, and current status. Detailed step-by-step procedu
 [Test-FailoverAndCompliance.md](Test-FailoverAndCompliance.md) (failover / verification); recorded results live
 alongside in the `*-Results.md` files.
 
+> **Re-validation run 2026-07-22** (build `5c29659`, post Path-A revert): 1.A.1.a (RS self-restore) and 2.A.a
+> (sharded self-restore) re-passed live with drift 0 + sentinel-gone fidelity proofs; both PIT tests
+> (1.B.1.a, 2.B.e) are currently **blocked by a stale oplog stream** from the ~5-week OM outage (needs a
+> skip-forward re-baseline). Details in [Test-Certification-Results-2026-07-22.md](Test-Certification-Results-2026-07-22.md).
+
 ## Test Summary
 
 Outcome: ✅ pass · ⚠️ partial / design-difference · 🔲 in progress / blocked · ❌ out of scope. Detailed
