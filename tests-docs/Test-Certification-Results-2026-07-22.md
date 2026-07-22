@@ -13,7 +13,7 @@ Live cert-test pass against both deployments. Results feed back into
 | 1.A.1.a RS self-restore | `aen-rs-00` | `om-20260722-125520` | ✅ **PASS** |
 | 2.A.a Sharded self-restore | `aen-cluster` | `om-20260722-131519` | ✅ **PASS** |
 | 1.B.1.a RS PIT | `aen-rs-00` | `om-20260722-190600` | ✅ **PASS** (after oplog re-baseline) |
-| 2.B.e Sharded PIT | `aen-cluster` | `om-20260722-191500` | ⚠️ **BLOCKED** (config-00 needs `packer∈mongod`) |
+| 2.B.e Sharded PIT | `aen-cluster` | `om-20260722-200000` | ✅ **PASS** (after config-00 `packer∈mongod` fix) |
 
 ---
 
@@ -79,8 +79,15 @@ Re-baseline + T1 + B all succeeded (tag `om-20260722-191500`; T1=39600/20000, B�
 
 **Root cause:** `packer` is **not in the `mongod` group** on `aen-mongo-config-00` (groups: packer, wheel), so it can't read the `640 mongod:mongod` oplog files — the exact gotcha documented for the RS nodes, recurring on the config server added during the restructure.
 
-**Fix (operator — classifier-gated `sudo` on config-00):**
+**Fix applied (operator ran the classifier-gated `sudo` on config-00):**
 ```bash
-ssh <you>@aen-mongo-config-00.fsa.lab 'sudo usermod -aG mongod packer && id packer'
+ssh <you>@aen-mongo-config-00.fsa.lab 'sudo usermod -aG mongod packer'   # -> groups now include 990(mongod)
 ```
-After that, re-run the sharded PIT cycle (skip-forward is already done). The capability itself passed live in June (2.B.e, `unrecoveredTail=0`).
+
+**Re-run after the fix → ✅ PASS** (fresh cycle, tag `om-20260722-200000`):
+- All 4 shards (incl. `config` on config-00) captured cleanly — no `scp` errors; 140 segments over 12 OM jobs.
+- **T1′** = `44600/20000`; **insert B′** (+5000) → **T2′** = `49600/20000`.
+- **Restore → T1′:** `loadtest=44600 (drift 0)`; per-shard `aen-shard_1=29704/13323` + `aen-shard_2=14896/6677` = aggregate.
+- **Replay-all → T2′:** `loadtest=49600 in [44600,49600] (unrecoveredTail=0)`, `payload=20000`.
+
+**Verdict:** full forward PIT recovery across all shards, `unrecoveredTail=0`. ✅ The config-00 `packer∈mongod` gotcha (RS gotcha recurring on the restructure's config server) is worth adding to the runbook.
