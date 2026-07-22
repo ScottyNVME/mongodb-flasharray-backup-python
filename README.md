@@ -177,6 +177,11 @@ SCSI-serial selection, oplog decode). The end-to-end orchestration is installed 
 `start-insert-load`, and `run-all-tests` commands. Manual end-to-end test procedures live in
 [tests-docs/](tests-docs/).
 
+**Certification status:** the MongoDB third-party backup certification testing is summarized in
+[tests-docs/Certification-Summary.md](tests-docs/Certification-Summary.md) (shareable overview), with the
+full item-by-item mapping in [tests-docs/Test-CertificationChecklist.md](tests-docs/Test-CertificationChecklist.md)
+and the latest live run in [tests-docs/Test-Certification-Results-2026-07-22.md](tests-docs/Test-Certification-Results-2026-07-22.md).
+
 ## Implementation notes
 
 - **FlashArray access** is a direct REST client (`fa_rest.py`): it connects to each fleet member directly, and
