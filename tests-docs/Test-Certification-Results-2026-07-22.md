@@ -14,6 +14,8 @@ Live cert-test pass against both deployments. Results feed back into
 | 2.A.a Sharded self-restore | `aen-cluster` | `om-20260722-131519` | ✅ **PASS** |
 | 1.B.1.a RS PIT | `aen-rs-00` | `om-20260722-190600` | ✅ **PASS** (after oplog re-baseline) |
 | 2.B.e Sharded PIT | `aen-cluster` | `om-20260722-200000` | ✅ **PASS** (after config-00 `packer∈mongod` fix) |
+| 4.a add-node → oplog reselection | `aen-rs-00` | — | ✅ **Demonstrated** (with snapshotable-lag note) |
+| 2.B.1.d arbiter | `aen-rs-00` | — | ⚠️ **Blocked** (OM needs DefaultWriteConcern in automationConfig) |
 
 ---
 
@@ -91,3 +93,27 @@ ssh <you>@aen-mongo-config-00.fsa.lab 'sudo usermod -aG mongod packer'   # -> gr
 - **Replay-all → T2′:** `loadtest=49600 in [44600,49600] (unrecoveredTail=0)`, `payload=20000`.
 
 **Verdict:** full forward PIT recovery across all shards, `unrecoveredTail=0`. ✅ The config-00 `packer∈mongod` gotcha (RS gotcha recurring on the restructure's config server) is worth adding to the runbook.
+
+---
+
+## Gap tests using `aen-mongo-04` as the extra node (2026-07-22)
+
+`aen-mongo-04` (agent active, `/data/mongo` FA-backed, no cluster role) driven via an allow-listed
+`/tmp/om_edit.py` (minimal additive/reversible automationConfig edits). Two operator-gated fixes were needed
+along the way: open **27017** in `-04`'s firewall (it only had 27020–23 from its prior shard life), and OM
+writes were only possible via the allow-rule.
+
+### 4.a — Set preferred oplog node when a node is added — ✅ Demonstrated
+- Added `aen-mongo-04` to `aen-rs-00` live (automationConfig v28→29); after opening 27017 it initial-synced to a healthy SECONDARY.
+- Re-ran the tailer: it **re-registered `preferredOplogNodes` over the updated 4-node topology** (Test-9 behavior confirmed against a real node addition), selecting a snapshotable secondary.
+- **Note:** OM does **not** mark a freshly-added member (or any hidden member) `snapshotable` immediately — the flag lags the topology change (the same way a newly-added shard's backup job lags, `JOB_NOT_FOUND`). So a just-added node is *considered* by the selector but only becomes an eligible preferred-oplog node after OM's backup subsystem re-scans. The tool's re-evaluation-on-add is what 4.a asks for; the selectability lag is an OM property, not a tool gap.
+
+### 2.B.1.d — PIT restore with an arbiter — ⚠️ Blocked (OM DefaultWriteConcern requirement)
+Attempted to add `aen-mongo-04` as an arbiter to `aen-rs-00`. OM rejected the automationConfig PUT:
+`Invalid config: DefaultWriteConcern must be set for processes in replica set aen-rs-00 where
+featureCompatibilityVersion is >= 5.0 and implicitDefaultWriteConcernMajority is false`. Setting it
+cluster-side (`setDefaultRWConcern → {w:"majority"}`, ok=1) did **not** satisfy OM — OM requires the default
+write concern configured in its own `clusterWideConfigurations` (schema undocumented; not reverse-engineered
+into a PUT on the shared prod project). **Finding:** adding an arbiter to an OM-managed RS (FCV ≥ 5.0) is
+gated on configuring OM's cluster-wide DefaultWriteConcern first — a real operational prerequisite for the
+arbiter cert item. `aen-rs-00` was returned to its clean 3-member state (no membership change persisted).
