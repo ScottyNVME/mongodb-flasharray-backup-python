@@ -234,6 +234,12 @@ STEP 7: poll until all shard primaries elect
 
 Every FA snapshot taken inside the `$backupCursor` window is therefore guaranteed recoverable by WiredTiger on restart.
 
+### Whole-cluster revert and the oplog-window requirement
+
+The restore overwrites **every** member's volume from its own snapshot and brings the whole replica set / cluster back at once. Because the members were captured at slightly different oplog positions (only the `$backupCursor` node is frozen; the others are replicating during the window), they reconcile to a common point via **normal MongoDB replication/rollback** after restart — exactly as a member that was briefly offline would.
+
+**Operational requirement (confirmed with MongoDB):** this reconciliation only succeeds while the elected primary still holds **enough oplog to span the gap between the snapshot point and the revert point**. If the oplog window is shorter than that spread, a lagging member finds no common point and hits `OplogStartMissing` (→ resync/rollback failure). So size the oplog comfortably larger than the replication lag present at snapshot time (and than any snapshot→restore delta you intend to land on). Backing up from a low-lag, low-traffic secondary — the default node-selection preference — keeps this spread small.
+
 ---
 
 ## How the Oplog Tailer Extends This to Full PITR
