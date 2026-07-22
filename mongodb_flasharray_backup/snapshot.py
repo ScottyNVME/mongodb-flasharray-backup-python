@@ -94,13 +94,6 @@ def _run(
         "--deployment",
         help="Deployment name to back up (selects '<NAME>__' keys in .env). Omit to use the flat keys.",
     ),
-    enable_replication: bool = typer.Option(
-        False,
-        "--enable-replication",
-        help="Path A: also replicate the OM-frozen secondary's per-member repl-PG snapshot out to the RS's "
-             "sibling-member arrays (blocks until present), so restore can clone one consistent source onto "
-             "every member. Requires 'initialize-protection-groups --enable-replication' first. Off by default.",
-    ),
 ) -> None:
     # Load .env FIRST (raises if missing) so all configuration is available before any work begins.
     config.load_config(deployment=deployment)
@@ -251,7 +244,6 @@ def _run(
 
         # ClusterDetail was already fetched in STEP 0 pre-flight.
         NodeIds: list[str] = []
-        FrozenMembers: list[dict] = []  # [{'Rs','NodeId'}] the OM-frozen backup-cursor node per RS (Path A)
 
         # Agent-reachability pre-check (mirrors start_oplog_tailer): don't select a node whose automation
         # agent is down to open the backup cursor on — OM's snapshotable flag lags a stopped agent by ~35s,
@@ -300,7 +292,6 @@ def _run(
                     "(the snapshot job would stall). Restart the agent or wait for a healthy secondary."
                 )
             NodeIds.append(Chosen.get("id"))
-            FrozenMembers.append({"Rs": RS.get("id"), "NodeId": Chosen.get("id")})
             config.write_host(
                 f"  {RS.get('id')} -> {Chosen.get('id')} [{Chosen.get('memberState')}] (agent active)", fg=config.CYAN
             )
@@ -573,56 +564,6 @@ def _run(
 
             # postSnap baseline - taken just after the FA snap and before /finish.
             PostSnapBaseline = get_collection_counts("postSnap")
-            # endregion
-
-            # region --- STEP 5b: Replicate the frozen secondary's snapshot to sibling arrays (Path A) ---
-            # Still inside the READY window (cursor open) so the repl-PG snapshot captures the same consistent
-            # point. For each RS, snapshot + replicate the OM-frozen member's per-member repl-PG to the RS's
-            # other member arrays, and block until it lands there. Restore clones this ONE source onto every
-            # member. Opt-in; requires 'initialize-protection-groups --enable-replication' to have wired the
-            # repl-PGs + a complete async mesh.
-            if enable_replication:
-                config.write_host(
-                    "\n=== STEP 5b: Replicating frozen-secondary snapshots (Path A) ===", fg=config.YELLOW
-                )
-                rs_membership = {
-                    rs.get("id"): [n.get("hostname") for n in (rs.get("nodes") or []) if n.get("hostname")]
-                    for rs in replica_sets if rs.get("id")
-                }
-                rs_array_map = config.build_rs_array_map(rs_membership, NodeVolumeMap)
-                frozen_sources = config.build_frozen_source_list(FrozenMembers, rs_array_map, NodeVolumeMap)
-                source_labels: list[str] = []
-                for src in frozen_sources:
-                    config.write_host(
-                        f"  {src['Rs']}: {src['ShortName']}/{src['ReplPg']} -> {src['Targets'] or '(no targets)'}",
-                        fg=config.CYAN,
-                    )
-                    if src["Targets"]:
-                        config._fa(
-                            FA.post_protection_group_snapshots(
-                                source_names=[src["ReplPg"]],
-                                protection_group_snapshot={"suffix": SnapshotTag},
-                                replicate_now=True,
-                                context_names=[src["ShortName"]],
-                            )
-                        )
-                        config.wait_replicated_snapshot(
-                            FA, src["ShortName"], src["ReplPg"], SnapshotTag, src["Targets"]
-                        )
-                    source_labels.append(f"{src['ShortName']}/{src['ReplPg']}")
-                # Record the Path A consistent sources on the main PG snapshot so restore can find them.
-                if source_labels:
-                    for CtxName in FaContextNames:
-                        config._fa(
-                            FA.put_protection_group_snapshots_tags_batch(
-                                resource_names=[f"{cfg.ProtectionGroupName}.{SnapshotTag}"],
-                                tag=[{"key": "mongo:sourceReplPgs", "value": ",".join(sorted(set(source_labels))),
-                                      "copyable": True}],
-                                context_names=[CtxName],
-                            ),
-                            allow_error=True,
-                        )
-                config.write_host("  Frozen-secondary snapshots replicated to all sibling arrays.", fg=config.GREEN)
             # endregion
 
             # region --- STEP 6: Signal finish to Ops Manager (closes $backupCursor) ---

@@ -305,60 +305,13 @@ class Client:
                             params={"names": self._csv(names), "filter": filter})
 
     def post_protection_group_snapshots(self, source_names: Optional[list] = None,
-                                        protection_group_snapshot: Any = None, replicate_now: Optional[bool] = None,
-                                        replicate: Optional[bool] = None, context_names: Optional[list] = None):
-        """Create a PG snapshot. replicate_now=True snapshots AND immediately replicates to the PG's
-        configured targets (Path A: fan the frozen secondary's snapshot out to sibling-member arrays)."""
+                                        protection_group_snapshot: Any = None, context_names: Optional[list] = None):
         return self._routed("POST", "protection-group-snapshots", context_names=context_names,
-                            params={"source_names": self._csv(source_names),
-                                    "replicate_now": ("true" if replicate_now else None),
-                                    "replicate": ("true" if replicate else None)},
-                            body=protection_group_snapshot)
+                            params={"source_names": self._csv(source_names)}, body=protection_group_snapshot)
 
     def delete_protection_group_snapshots(self, names: Optional[list] = None, context_names: Optional[list] = None):
         return self._routed("DELETE", "protection-group-snapshots", context_names=context_names,
                             params={"names": self._csv(names)})
-
-    # ---- async replication: array connections + PG replication targets ----------------------------------
-    # Path A pre-positions the OM-frozen secondary's snapshot on the arrays hosting that RS's other members,
-    # so restore can clone one consistent source onto every member. That requires (a) an async-replication
-    # connection between the source and each sibling array, and (b) those sibling arrays set as replication
-    # targets on the per-member PG. See docs/path-a-implementation-plan.md.
-    def get_array_connections(self, context_names: Optional[list] = None):
-        return self._routed("GET", "array-connections", context_names=context_names)
-
-    def post_array_connections(self, connection: Any = None, context_names: Optional[list] = None):
-        """Establish an async-replication connection to a remote array. `connection` carries the remote
-        management/replication addresses and connection key (FA array-connection POST shape)."""
-        return self._routed("POST", "array-connections", context_names=context_names, body=connection)
-
-    def delete_array_connections(self, names: Optional[list] = None, context_names: Optional[list] = None):
-        return self._routed("DELETE", "array-connections", context_names=context_names,
-                            params={"names": self._csv(names)})
-
-    def get_protection_groups_targets(self, group_names: Optional[list] = None,
-                                      member_names: Optional[list] = None, context_names: Optional[list] = None):
-        return self._routed("GET", "protection-groups/targets", context_names=context_names,
-                            params={"group_names": self._csv(group_names), "member_names": self._csv(member_names)})
-
-    def post_protection_groups_targets(self, group_names: Optional[list] = None,
-                                       member_names: Optional[list] = None, context_names: Optional[list] = None):
-        """Add replication target array(s) to the PG(s). member_names = the target array names."""
-        return self._routed("POST", "protection-groups/targets", context_names=context_names,
-                            params={"group_names": self._csv(group_names), "member_names": self._csv(member_names)})
-
-    def patch_protection_groups_targets(self, group_names: Optional[list] = None, member_names: Optional[list] = None,
-                                        protection_group_target: Any = None, context_names: Optional[list] = None):
-        """Allow/disallow a replication target (protection_group_target={'allowed': True}); run against the
-        TARGET array's context so the target permits replicas from the source."""
-        return self._routed("PATCH", "protection-groups/targets", context_names=context_names,
-                            params={"group_names": self._csv(group_names), "member_names": self._csv(member_names)},
-                            body=protection_group_target)
-
-    def delete_protection_groups_targets(self, group_names: Optional[list] = None,
-                                         member_names: Optional[list] = None, context_names: Optional[list] = None):
-        return self._routed("DELETE", "protection-groups/targets", context_names=context_names,
-                            params={"group_names": self._csv(group_names), "member_names": self._csv(member_names)})
 
     def get_volumes(self, names: Optional[list] = None, filter: Optional[str] = None,
                     context_names: Optional[list] = None):

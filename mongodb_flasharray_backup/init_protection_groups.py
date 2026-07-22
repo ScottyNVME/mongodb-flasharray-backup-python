@@ -20,61 +20,6 @@ import typer
 from . import config
 
 
-def _wire_repl_pg(fa, rpg, volume_name, source_array, target_arrays, what_if):
-    """Create the per-member replication PG on source_array, add the member volume, and set its replication
-    targets to the sibling-member arrays (allowing inbound replicas on each target). Idempotent."""
-    existing = config._fa(fa.get_protection_groups(names=[rpg], context_names=[source_array]), allow_error=True)
-    if not existing:
-        if what_if:
-            config.write_host(f"    [WhatIf] Would create repl-PG '{rpg}' on {source_array}", fg=config.DARK_YELLOW)
-        else:
-            config._fa(fa.post_protection_groups(names=[rpg], context_names=[source_array]))
-            config.write_host(f"    Created repl-PG '{rpg}'", fg=config.GREEN)
-    else:
-        config.write_host(f"    repl-PG '{rpg}' exists", fg=config.DARK_GRAY)
-
-    member = config._fa(fa.get_protection_groups_volumes(group_names=[rpg], member_names=[volume_name],
-                                                         context_names=[source_array]), allow_error=True)
-    if not member:
-        if what_if:
-            config.write_host(f"    [WhatIf] Would add '{volume_name}' to '{rpg}'", fg=config.DARK_YELLOW)
-        else:
-            config._fa(fa.post_protection_groups_volumes(group_names=[rpg], member_names=[volume_name],
-                                                         context_names=[source_array]))
-            config.write_host(f"    Added '{volume_name}' to '{rpg}'", fg=config.GREEN)
-
-    existing_targets = config._fa(fa.get_protection_groups_targets(group_names=[rpg], context_names=[source_array]),
-                                  allow_error=True) or []
-    have = {getattr(getattr(t, "member", None), "name", None) for t in existing_targets}
-    for tgt in target_arrays:
-        if tgt in have:
-            config.write_host(f"    target '{tgt}' already set", fg=config.DARK_GRAY)
-            continue
-        if what_if:
-            config.write_host(f"    [WhatIf] Would add target '{tgt}' to '{rpg}' (+allow on target)",
-                              fg=config.DARK_YELLOW)
-        else:
-            config._fa(fa.post_protection_groups_targets(group_names=[rpg], member_names=[tgt],
-                                                         context_names=[source_array]))
-            # Allow inbound replicas on the target side so replication is permitted.
-            config._fa(fa.patch_protection_groups_targets(group_names=[rpg], member_names=[tgt],
-                       protection_group_target={"allowed": True}, context_names=[tgt]), allow_error=True)
-            config.write_host(f"    Added target '{tgt}' (+allowed)", fg=config.GREEN)
-
-
-def _tag_repl_metadata(fa, rs_array_map):
-    """Stamp mongo:rs + mongo:replpg on each member volume so snapshot/restore know the RS and repl-PG."""
-    for rid, entries in rs_array_map.items():
-        for e in entries:
-            tags = [
-                {"key": config.VOLMAP_TAG_RS, "value": rid, "copyable": True},
-                {"key": config.VOLMAP_TAG_REPLPG, "value": config.repl_pg_name(e["VolumeName"]), "copyable": True},
-            ]
-            config._fa(fa.put_volumes_tags_batch(resource_names=[e["VolumeName"]], tag=tags,
-                                                 context_names=[e["ShortName"]]))
-    config.write_host("  Tagged RS id + repl-PG name on member volumes.", fg=config.GREEN)
-
-
 def _run(
     what_if: bool = typer.Option(
         False, "--what-if", help="Show what would be created without making changes"
@@ -93,13 +38,6 @@ def _run(
         None,
         "--deployment",
         help="Deployment name to initialize (selects '<NAME>__' keys in .env). Omit to use the flat keys.",
-    ),
-    enable_replication: bool = typer.Option(
-        False,
-        "--enable-replication",
-        help="Path A: verify a complete async-replication mesh among each RS's member arrays and wire "
-             "per-member replication PGs (targets = sibling-member arrays). Fails with guidance if a "
-             "required async link is missing. Off by default; existing snapshot/restore is unaffected.",
     ),
 ) -> None:
     # Load env-derived config FIRST.
@@ -269,60 +207,6 @@ def _run(
         except Exception as e:
             errors.append(f"{node} ({short_name}): {e}")
             config.write_host(f"    ERROR: {e}", fg=config.RED)
-
-    # Path A replication wiring (opt-in): verify a complete async mesh among each RS's member arrays, then
-    # create per-member replication PGs whose targets are the sibling-member arrays. Off by default so the
-    # existing snapshot/restore flow is untouched.
-    if enable_replication:
-        config.write_host("\n=== Replication wiring (Path A) ===", fg=config.YELLOW)
-        try:
-            rs_membership = config.get_replica_set_membership(cluster_nodes)
-            rs_array_map = config.build_rs_array_map(rs_membership, node_volume_map)
-            member_arrays = sorted({e["ShortName"] for entries in rs_array_map.values() for e in entries})
-            config.write_host(
-                f"  {len(rs_array_map)} replica set(s); member arrays: {', '.join(member_arrays)}",
-                fg=config.CYAN,
-            )
-
-            # Verify the async-replication mesh among each RS's member arrays before wiring anything.
-            connected = config.async_replication_pairs(fa, member_arrays)
-            missing = config.missing_async_mesh_links(rs_array_map, connected)
-            if missing:
-                for m in missing:
-                    msg = (
-                        f"RS '{m['Rs']}': no CONNECTED async-replication link between {m['ArrayA']} and "
-                        f"{m['ArrayB']} - required to replicate the frozen secondary's snapshot between these "
-                        "member arrays. Establish an async-replication connection between them (note: two "
-                        "arrays sharing a sync-replication pod cannot also async-replicate)."
-                    )
-                    config.write_host(f"  MESH GAP: {msg}", fg=config.RED)
-                    errors.append(msg)
-                config.write_host(
-                    "  Async mesh incomplete - skipping repl-PG creation. Fix the links above and re-run.",
-                    fg=config.DARK_YELLOW,
-                )
-            else:
-                config.write_host("  Async mesh complete for all replica sets.", fg=config.GREEN)
-                for rid, entries in rs_array_map.items():
-                    arrays_in_rs = sorted({e["ShortName"] for e in entries})
-                    for e in entries:
-                        vol, arr = e["VolumeName"], e["ShortName"]
-                        rpg = config.repl_pg_name(vol)
-                        targets = [a for a in arrays_in_rs if a != arr]
-                        config.write_host(
-                            f"\n  [{rid}: {vol} on {arr} -> repl-PG '{rpg}', targets {targets or '(none)'}]",
-                            fg="white",
-                        )
-                        try:
-                            _wire_repl_pg(fa, rpg, vol, arr, targets, what_if)
-                        except Exception as ex:  # noqa: BLE001
-                            errors.append(f"repl-PG {rpg} on {arr}: {ex}")
-                            config.write_host(f"    ERROR: {ex}", fg=config.RED)
-                if not what_if:
-                    _tag_repl_metadata(fa, rs_array_map)
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"replication wiring: {e}")
-            config.write_host(f"  ERROR: {e}", fg=config.RED)
 
     # Prune orphaned PG volume members.
     if prune:
