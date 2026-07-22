@@ -1304,4 +1304,47 @@ def source_snapshot_member_for(member_array: str, source_array: str, repl_pg: st
     return base if member_array == source_array else f"{source_array}:{base}"
 
 
+def parse_source_repl_pgs(tag_value: str, rs_array_map: dict) -> list:
+    """Restore-side. Reconstruct the per-RS consistent sources from the 'mongo:sourceReplPgs' snapshot tag
+    ('array/replpg,array/replpg,...'), matching each source to its RS via rs_array_map. Returns
+    [{'Rs','ShortName','VolumeName','ReplPg'}] (the frozen_sources shape build_clone_plan expects)."""
+    out: list = []
+    for item in (tag_value or "").split(","):
+        item = item.strip()
+        if not item or "/" not in item:
+            continue
+        arr, replpg = item.split("/", 1)
+        vol = replpg[:-len(REPL_PG_SUFFIX)] if replpg.endswith(REPL_PG_SUFFIX) else replpg
+        rs = next((rid for rid, members in rs_array_map.items()
+                   if any(m["ShortName"] == arr and m["VolumeName"] == vol for m in members)), None)
+        if rs is not None:
+            out.append({"Rs": rs, "ShortName": arr, "VolumeName": vol, "ReplPg": replpg})
+    return out
+
+
+def build_clone_plan(rs_array_map: dict, frozen_sources: list, suffix: str) -> list:
+    """Pure. For every RS member, the replicated source-snapshot member to clone from and the target volume.
+    frozen_sources = build_frozen_source_list(...) (the one consistent source per RS). Returns
+    [{'Rs','MemberArray','MemberVolume','SourceMember'}] -- the frozen member clones from its LOCAL source,
+    every other member from the source-prefixed replica."""
+    src_by_rs: dict = {}
+    for s in frozen_sources:
+        src_by_rs.setdefault(s["Rs"], s)  # one consistent source per RS
+    plan: list = []
+    for rs, members in rs_array_map.items():
+        src = src_by_rs.get(rs)
+        if not src:
+            continue
+        for m in members:
+            plan.append({
+                "Rs": rs,
+                "MemberArray": m["ShortName"],
+                "MemberVolume": m["VolumeName"],
+                "SourceMember": source_snapshot_member_for(
+                    m["ShortName"], src["ShortName"], src["ReplPg"], suffix, src["VolumeName"]
+                ),
+            })
+    return plan
+
+
 # endregion

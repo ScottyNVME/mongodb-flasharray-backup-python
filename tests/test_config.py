@@ -462,6 +462,36 @@ def test_wait_om_restore_state_raises_on_failed(monkeypatch):
 
 
 # --------------------------------------------------------------------------------------------------------
+# Path A restore clone plan: source tag parsing + clone-to-all plan (frozen member local, others prefixed).
+# --------------------------------------------------------------------------------------------------------
+def _rs_map_abc():
+    return {"rs0": [
+        {"Node": "n1", "VolumeName": "v1", "ShortName": "arrA"},
+        {"Node": "n2", "VolumeName": "v2", "ShortName": "arrB"},
+        {"Node": "n3", "VolumeName": "v3", "ShortName": "arrC"},
+    ]}
+
+
+def test_parse_source_repl_pgs_matches_rs():
+    # source = v2 on arrB (repl-PG v2-repl); should resolve to rs0.
+    out = config.parse_source_repl_pgs("arrB/v2-repl", _rs_map_abc())
+    assert out == [{"Rs": "rs0", "ShortName": "arrB", "VolumeName": "v2", "ReplPg": "v2-repl"}]
+
+
+def test_build_clone_plan_frozen_member_local_others_prefixed():
+    # Frozen source is v2 on arrB; every member clones from that ONE source -- arrB local, arrA/arrC prefixed.
+    frozen_sources = [{"Rs": "rs0", "ShortName": "arrB", "VolumeName": "v2", "ReplPg": "v2-repl"}]
+    plan = config.build_clone_plan(_rs_map_abc(), frozen_sources, "om-9")
+    by_vol = {p["MemberVolume"]: p["SourceMember"] for p in plan}
+    assert by_vol == {
+        "v1": "arrB:v2-repl.om-9.v2",   # arrA member <- replicated (source-prefixed)
+        "v2": "v2-repl.om-9.v2",        # arrB member (the source array) <- local
+        "v3": "arrB:v2-repl.om-9.v2",   # arrC member <- replicated
+    }
+    assert all(p["Rs"] == "rs0" for p in plan)
+
+
+# --------------------------------------------------------------------------------------------------------
 # Multi-volume discovery parser (parse_fa_volume_serials) — pure, no live node.
 # --------------------------------------------------------------------------------------------------------
 def test_parse_fa_volume_serials_single_volume_prdm():
