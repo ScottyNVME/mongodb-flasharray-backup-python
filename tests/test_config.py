@@ -8,6 +8,7 @@ SCSI-serial selection logic of resolve_node_to_array_volume_map.
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -396,6 +397,68 @@ def test_build_frozen_source_list_targets_are_sibling_arrays():
         "Rs": "rs0", "Host": "n2", "VolumeName": "v2", "ShortName": "arrB",
         "ReplPg": "v2-repl", "Targets": ["arrA", "arrC"],
     }]
+
+
+# --------------------------------------------------------------------------------------------------------
+# Path A restore helpers: replicated-source member naming + OM restore lifecycle wrappers.
+# --------------------------------------------------------------------------------------------------------
+def test_source_snapshot_member_for_local_vs_replicated():
+    # On the source array itself -> local name; on any other (replicated-to) array -> source-prefixed.
+    assert config.source_snapshot_member_for("arrA", "arrA", "v-repl", "om-1", "v") == "v-repl.om-1.v"
+    assert config.source_snapshot_member_for("arrB", "arrA", "v-repl", "om-1", "v") == "arrA:v-repl.om-1.v"
+
+
+def test_invoke_om_restore_create_sets_volume_restore_and_returns_id(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(config, "_require_cfg", lambda: SimpleNamespace(GroupId="G", ClusterId="C"))
+
+    def fake_api(method="GET", path="", body=None, path_prefix="backup/third_party/"):
+        calls.update(method=method, path=path, body=body)
+        return {"restoreId": "R1"}
+
+    monkeypatch.setattr(config, "invoke_om_api", fake_api)
+    rid = config.invoke_om_restore_create(
+        snapshots_metadata=[{"x": 1}], nodes=[{"id": "n1", "restoreRole": "PRIMARY"}]
+    )
+    assert rid == "R1"
+    assert calls["method"] == "POST"
+    assert calls["path"] == "group/G/clusters/C/restore"
+    assert calls["body"]["volumeRestore"] is True  # hard requirement for a volume-level vendor
+    assert calls["body"]["nodes"] == [{"id": "n1", "restoreRole": "PRIMARY"}]
+
+
+def test_invoke_om_restore_create_raises_without_id(monkeypatch):
+    monkeypatch.setattr(config, "_require_cfg", lambda: SimpleNamespace(GroupId="G", ClusterId="C"))
+    monkeypatch.setattr(config, "invoke_om_api", lambda **k: {})
+    with pytest.raises(RuntimeError, match="no restoreId"):
+        config.invoke_om_restore_create(snapshots_metadata=[], nodes=[])
+
+
+def test_om_restore_files_copied_path_and_body(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(config, "_require_cfg", lambda: SimpleNamespace(GroupId="G"))
+    monkeypatch.setattr(config, "invoke_om_api_with_retry",
+                        lambda method="GET", path="", body=None: calls.update(path=path, body=body))
+    config.om_restore_files_copied("R1", "node-1")
+    assert calls["path"] == "group/G/restore/R1/filesCopied"
+    assert calls["body"] == {"nodeId": "node-1"}
+
+
+def test_wait_om_restore_state_polls_until_target(monkeypatch):
+    monkeypatch.setattr(config, "_require_cfg", lambda: SimpleNamespace(GroupId="G"))
+    states = iter([{"state": "INITIAL"}, {"state": "WAITING_FOR_FILES"}])
+    monkeypatch.setattr(config, "invoke_om_api_with_retry", lambda **k: next(states))
+    monkeypatch.setattr(config.time, "sleep", lambda s: None)
+    status = config.wait_om_restore_state("R1", "WAITING_FOR_FILES", poll_interval_sec=0)
+    assert status["state"] == "WAITING_FOR_FILES"
+
+
+def test_wait_om_restore_state_raises_on_failed(monkeypatch):
+    monkeypatch.setattr(config, "_require_cfg", lambda: SimpleNamespace(GroupId="G"))
+    monkeypatch.setattr(config, "invoke_om_api_with_retry", lambda **k: {"state": "FAILED"})
+    monkeypatch.setattr(config.time, "sleep", lambda s: None)
+    with pytest.raises(RuntimeError, match="FAILED"):
+        config.wait_om_restore_state("R1", "COMPLETED", poll_interval_sec=0)
 
 
 # --------------------------------------------------------------------------------------------------------

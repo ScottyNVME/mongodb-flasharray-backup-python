@@ -612,6 +612,70 @@ def wait_om_snapshot_state(
             time.sleep(poll_interval_sec)
 
 
+# --- Path A restore: Ops Manager third-party restore API lifecycle -------------------------------------
+# The restore is OM-orchestrated (volumeRestore vendor): create -> start -> poll to the "place files" state
+# -> the vendor clones the ONE consistent source onto each member's volume -> filesCopied per node -> poll
+# to COMPLETED. See docs/path-a-implementation-plan.md and third-party-backup-reference.md (Restore API).
+# NOTE: exact request-body fields (volumeRestore placement, filesCopied node key) are built to the best
+# known shape and must be confirmed against the live OM API / MongoDB (remediation-doc open questions).
+def invoke_om_restore_create(snapshots_metadata: Any, nodes: list, volume_restore: bool = True,
+                             pit_timestamp: Any = None) -> str:
+    """Create a third-party restore job and return its restoreId. `nodes` = [{'id','restoreRole'}] for every
+    node incl. arbiters (arbiters receive no data). volume_restore MUST be True for a volume-level vendor
+    (Pure) -- without it the agent runs DeleteDbFiles + fileList pruning and wipes the oplog between phases."""
+    cfg = _require_cfg()
+    body: dict = {"snapshotsMetadata": snapshots_metadata, "nodes": nodes, "volumeRestore": volume_restore}
+    if pit_timestamp is not None:
+        body["pitTimestamp"] = pit_timestamp
+    resp = invoke_om_api(method="POST", path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/restore", body=body)
+    rid = resp.get("restoreId") if isinstance(resp, dict) else getattr(resp, "restoreId", None)
+    if not rid:
+        raise RuntimeError(f"OM restore create returned no restoreId: {resp}")
+    return rid
+
+
+def start_om_restore(restore_id: str) -> Any:
+    cfg = _require_cfg()
+    return invoke_om_api(method="POST", path=f"group/{cfg.GroupId}/restore/{restore_id}/start")
+
+
+def om_restore_files_copied(restore_id: str, node_id: str) -> Any:
+    """Signal (per non-arbiter node) that the vendor has placed the restored files at that node's dbPath."""
+    cfg = _require_cfg()
+    return invoke_om_api_with_retry(method="POST",
+                                    path=f"group/{cfg.GroupId}/restore/{restore_id}/filesCopied",
+                                    body={"nodeId": node_id})
+
+
+def om_restore_fail(restore_id: str) -> Any:
+    """Abort a restore job (OM then deletes destination data). Best-effort; used on the error path."""
+    cfg = _require_cfg()
+    return invoke_om_api_with_retry(method="POST", path=f"group/{cfg.GroupId}/restore/{restore_id}/fail")
+
+
+def wait_om_restore_state(restore_id: str, target_states, timeout_minutes: int = 150,
+                          poll_interval_sec: int = 10) -> dict:
+    """Poll a restore job until its state is in target_states (a str or iterable), aborting on FAILED or a
+    timeout. Returns the final status. Two waits are typical: the 'ready for the vendor to place files'
+    state, then COMPLETED."""
+    cfg = _require_cfg()
+    targets = {target_states} if isinstance(target_states, str) else set(target_states)
+    deadline = time.monotonic() + timeout_minutes * 60
+    state = ""
+    status: Any = None
+    while state not in targets:
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"Restore {restore_id} timed out waiting for {sorted(targets)} (last={state}).")
+        if state in ("FAILED",):
+            raise RuntimeError(f"Restore {restore_id} entered {state} - aborting.")
+        status = invoke_om_api_with_retry(path=f"group/{cfg.GroupId}/restore/{restore_id}")
+        state = status.get("state") if isinstance(status, dict) else getattr(status, "state", "")
+        write_host(f"  {datetime.now().strftime('%H:%M:%S')}  restore state = {state}", fg=CYAN)
+        if state not in targets:
+            time.sleep(poll_interval_sec)
+    return status if isinstance(status, dict) else {"state": state}
+
+
 # endregion
 
 # region --- FlashArray connection + response helpers (direct REST) ---
@@ -1229,6 +1293,15 @@ def wait_replicated_snapshot(fa: Any, source_array: str, repl_pg: str, suffix: s
                 f"{', '.join(sorted(pending))}. Check the async-replication link(s) and throttle."
             )
         time.sleep(poll_sec)
+
+
+def source_snapshot_member_for(member_array: str, source_array: str, repl_pg: str, suffix: str,
+                               source_volume: str) -> str:
+    """Pure. The repl-PG snapshot volume-member to CLONE FROM, as named on member_array: the local name on
+    the frozen secondary's own (source) array, and the source-prefixed name on every array it replicated to.
+    Path A restore clones this ONE source onto every member's volume, so all members share one oplog point."""
+    base = f"{repl_pg}.{suffix}.{source_volume}"
+    return base if member_array == source_array else f"{source_array}:{base}"
 
 
 # endregion
