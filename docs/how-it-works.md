@@ -249,6 +249,26 @@ The restore overwrites **every** member's volume from its own snapshot and bring
 
 **Operational requirement (confirmed with MongoDB):** this reconciliation only succeeds while the elected primary still holds **enough oplog to span the gap between the snapshot point and the revert point**. If the oplog window is shorter than that spread, a lagging member finds no common point and hits `OplogStartMissing` (→ resync/rollback failure). So size the oplog comfortably larger than the replication lag present at snapshot time (and than any snapshot→restore delta you intend to land on). Backing up from a low-lag, low-traffic secondary — the default node-selection preference — keeps this spread small.
 
+### How the primary is elected after a restore
+
+There is **no "original primary" that automatically resumes.** Primary is runtime state — a member of the Raft-like election term held in memory and in the replica-set term/config — not a durable property captured in the snapshot. When every member's volume is reverted and `mongod` restarts, all members come up as **secondaries** (`STARTUP2` → `RECOVERING` → `SECONDARY`) and then run a real election. Even the node that was primary at snapshot time must win that election like any other member.
+
+**What the election favors — and why "freshest optime always wins" is too strong.** Two hard rules govern the outcome:
+
+1. A member will **not vote for a candidate whose optime is older than its own.**
+2. Winning requires a **majority of votes.**
+
+The member with the freshest optime winning is an *emergent consequence* of rule 1 (a stale candidate can't gather a majority when fresher voters refuse it) — not a guarantee the system makes. The freshest member does **not** win when:
+
+- **Priority overrides freshness.** A higher-`priority` member that is reasonably caught up will call elections and take over even if another member is slightly fresher; the fresher members then **roll back** their extra ops to match it — discarding the freshest data.
+- **The freshest node isn't up / can't see a majority** when the election settles (slow restart, unreachable, minority side of a partition). A less-fresh member wins and the fresh node rolls back when it rejoins.
+- **Timing.** Elections are racy; among members at effectively equal optime, whoever gets a majority for the newest term first wins.
+- **Voting configuration** (arbiters, `votes: 0`, priority-0 members) changes who can win or trigger an election.
+
+**What this means for this integration.** With **equal priority** across members, all members **up and mutually reachable before the election settles**, and no arbiter/zero-vote members, the freshest-optime member wins in practice — because no other eligible member can out-vote it. That recovery point is that member's snapshot instant; the others roll forward or roll back to converge on it. This is a defensible claim *only given those preconditions*.
+
+**If a deterministic recovery point is required,** do not rely on the freshest-optime tendency. Pin the winner with `priority`, or bring one designated member up first and hold the others back. The restore flow today does not set member priority or enforce startup ordering, so the guaranteed statement is: *the set elects a freshest-eligible member; determinism requires equal priority and all members present before the election completes.*
+
 ---
 
 ## How the Oplog Tailer Extends This to Full PITR
