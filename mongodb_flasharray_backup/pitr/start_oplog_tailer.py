@@ -198,25 +198,23 @@ def _run(
                 n for n in (rs.get("nodes") or [])
                 if n.get("snapshotable") is True and _agent_active(n)
             ]
-            # Priority: hidden secondary > secondary > primary
-            chosen = next(
-                (n for n in candidates
-                 if n.get("memberState") == "SECONDARY" and n.get("hidden") is True),
-                None,
-            )
+            # Tail oplog from the PRIMARY (matches the snapshot's backup-cursor node), so the snapshot's
+            # cursor-pinned member and the oplog stream come from the same node. Fall back to a secondary
+            # only if the primary isn't snapshotable/agent-reachable.
+            chosen = next((n for n in candidates if n.get("memberState") == "PRIMARY"), None)
             if not chosen:
                 chosen = next(
                     (n for n in candidates if n.get("memberState") == "SECONDARY"),
                     None,
                 )
             if not chosen:
-                chosen = candidates[0] if candidates else None  # agent-reachable primary fallback
+                chosen = candidates[0] if candidates else None  # any agent-reachable snapshotable member
             if not chosen:
                 raise RuntimeError(
                     f"No snapshotable node with a reachable automation agent for replica set "
                     f"{rs.get('id')}. Refusing to set a preferred oplog node on a host whose agent is down "
                     "— it would leave the oplog snapshot job stuck PENDING and create an unrecoverable "
-                    "coverage gap. Restart the agent or wait for a healthy secondary."
+                    "coverage gap. Restart the agent or wait for a healthy primary."
                 )
             tailing_node_ids.append(chosen.get("id"))
             config.write_host(
