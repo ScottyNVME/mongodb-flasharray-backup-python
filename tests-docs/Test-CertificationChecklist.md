@@ -8,6 +8,13 @@ implementation, how to run it, and current status. **For a shareable, high-level
 [Test-FailoverAndCompliance.md](Test-FailoverAndCompliance.md) (failover / verification); recorded results live
 alongside in the `*-Results.md` files.
 
+> **Re-validation run 2026-07-23** (build `130435a`, **primary-sourced** backup cursor + oplog stream): the
+> four core in-scope tests all re-passed live — **1.A.1.a** + **2.A.a** (self-restore, drift 0 / sentinel-gone)
+> and **1.B.1.a** + **2.B.e** (PIT, `unrecoveredTail=0`, deterministic marker B recovered). The tailer + cursor
+> now target the **primary** on every RS/shard (confirmed from OM's log). PIT again required a **skip-forward
+> re-baseline** of the stale sharded oplog cursor. Details in
+> [Test-Certification-Results-2026-07-22.md](Test-Certification-Results-2026-07-22.md) (bottom sections).
+>
 > **Re-validation run 2026-07-22** (build `5c29659`, post Path-A revert): the four core in-scope tests all
 > re-passed live — **1.A.1.a** + **2.A.a** (self-restore, drift 0 / sentinel-gone) and **1.B.1.a** + **2.B.e**
 > (PIT, `unrecoveredTail=0`). PIT required a **skip-forward re-baseline** of the OM oplog cursor (stale from

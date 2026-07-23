@@ -157,3 +157,37 @@ cycle end-to-end; a post-snapshot write (marker B) is reverted by the restore an
    `aen-cluster` instead of `aen-rs-00` (harmless here — the misdirected replay found no matching segments —
    but it produced a misleading `unrecoveredTail` figure). Always pass `--deployment` on multi-deployment
    installs. See [../docs/LESSONS.md](../docs/LESSONS.md).
+
+---
+
+## Full in-scope re-validation sweep (2026-07-23) — all four core tests PASS
+
+Re-ran every valid/in-scope certification test on the **primary-sourced** backup cursor + oplog stream (build
+`main` @ `130435a`). **Environment gate:** OM reachable; `aen-cluster` 10/10 healthy (config + 3 shards),
+`aen-rs-00` 3/3 healthy. Fidelity proofs use the *mutate-then-restore* method (non-PIT) and a deterministic
+post-snapshot marker **B** in `pitrtest.marks` (PIT).
+
+| Item | Deployment | Tag | Result |
+|---|---|---|---|
+| **1.A.1.a** RS self-restore | `aen-rs-00` | `om-20260723-184500` | ✅ **PASS** — mutate (delete all + add `sentinel`) → restore → **loadtest/payload=17000/5000 (drift 0)**, **`sentinel` gone** (true PIT revert, cursor on primary `aen-mongo-06`). |
+| **1.B.1.a** RS PIT | `aen-rs-00` | `om-20260723-183000` | ✅ **PASS** (earlier today) — primary-sourced tailer + cursor; restore→T1 `B=0`, replay→T2 **`B=1`**. See the primary-sourced section above. |
+| **2.A.a** Sharded self-restore | `aen-cluster` | `om-20260723-185500` | ✅ **PASS** — mutate (delete all + `sentinel`) → restore → **49600/20000 (drift 0)**, **`sentinel` gone**; per-shard STEP 8 `shard_1=33055` + `shard_2=16545` = 49600 aggregate. |
+| **2.B.e** Sharded PIT | `aen-cluster` | `om-20260723-191000` | ✅ **PASS** — A pre-T1, snapshot T1 (49600), insert **B** + 2000 docs (→51600), drain, stop. Restore→T1: **49600 (drift 0)**, `A=1 B=0`. Replay-all→T2: **51600 `unrecoveredTail=0`** (payload also 0), **`B=1`** recovered across all shards. |
+
+**Primary sourcing confirmed live:** the sharded tailer selected the **PRIMARY** for each shard
+(`shard_2→aen-mongo-01`, `shard_3→aen-mongo-03`, `config→aen-mongo-config-00`, `shard_1→aen-mongo-02`) and set
+`preferredOplogNodes` accordingly; the RS tailer + snapshot cursor confirmed on `aen-mongo-06` (primary).
+
+**Operational notes from this sweep (both already in the runbook):**
+- The **sharded oplog cursor was stale** (draining ~a day of backlog; the rapid `scp` storm hit an SSH `exit
+  255` that `/failed` the job and re-drained from the same point — no progress). Cleared with a **skip-forward
+  re-baseline**: a fresh oplog snapshot spanning `[stale → now]` `/finish`ed without copying advanced the cursor
+  to **70 s behind now**; the restarted tailer then captured current segments immediately. (A prior tailer job
+  left `FAILED` did **not** block the fresh create.)
+- The load generator on `aen-cluster` was idle during the run (loadtest steady at 49600), so the +2000 manual
+  post-T1 inserts and marker **B** provided the forward-recovery delta — `unrecoveredTail=0` confirms all of it
+  replayed.
+
+**Verdict:** all in-scope, live-runnable certification tests pass on the primary-sourced implementation —
+RS + sharded self-restore (drift 0, fidelity proven) and RS + sharded PIT (`unrecoveredTail=0`, marker B
+recovered).
