@@ -26,7 +26,10 @@ These are one-time and usually provisioned by an admin. Confirm each before cont
       replica set, register it via the third-party `…/clusters/{id}/manage` endpoint — no OM snapshot store is
       needed; the standard `backupConfigs statusName=STARTED` path 409s `Could not find available Snapshot Store`.*
 - [ ] **SSH key-based auth** from the machine you run this on to **every cluster node** as one user
-      (`SSH_USER`), with **passwordless `sudo`**. Test: `ssh <SSH_USER>@<node> sudo -n true`.
+      (`SSH_USER`), with **passwordless `sudo`** — needed only by **restore** (snapshot/PITR/init-pg use no
+      sudo). You can grant blanket `NOPASSWD: ALL` or scope it to the exact commands restore runs; see
+      [Sudo access on the cluster nodes](#sudo-access-on-the-cluster-nodes-restore-only). Test:
+      `ssh <SSH_USER>@<node> sudo -n true`.
 - [ ] **An Ops Manager API key** (public/private) with role **`GLOBAL_BACKUP_ADMIN`**, and your IP on its
       access list.
 - [ ] **FlashArray credentials** — a directory account (`FA_USERNAME`/`FA_PASSWORD`) that authorizes on
@@ -35,6 +38,76 @@ These are one-time and usually provisioned by an admin. Confirm each before cont
 
 Also make sure the SSH user is in the **`mongod` group** on every node (so it can read agent-written oplog
 files for PITR): `ssh <SSH_USER>@<node> id` should list `mongod`. If not: `sudo usermod -aG mongod <SSH_USER>`.
+
+---
+
+## Sudo access on the cluster nodes (restore only)
+
+Only **`restore-mongo-snapshot`** touches the OS as root — it stops the agents, unmounts `/data/mongo`,
+rescans the LUN, and remounts. **`new-mongo-snapshot`, `start`/`stop-oplog-tailer`, `invoke-oplog-replay`, and
+`initialize-protection-groups` use no sudo at all** — they run as `SSH_USER` (the tailer only needs the
+`mongod` group, above, to read oplog files).
+
+The prerequisites assume `SSH_USER` has passwordless `sudo`. If you'd rather not grant blanket
+`NOPASSWD: ALL`, scope it to exactly what restore invokes over SSH on each node:
+
+```text
+systemctl stop  mongodb-mms-automation-agent      # STEP 1  quiesce OM's agent
+systemctl start mongodb-mms-automation-agent      # STEP 6  hand control back
+pkill -TERM -x mongod                             # STEP 2  stop mongod/mongos (and -KILL to escalate)
+pkill -TERM -x mongos
+pkill -KILL -x mongod
+pkill -KILL -x mongos
+umount /data/mongo                                # STEP 3  unmount before the volume overwrite
+lsof  +f -- /data/mongo                           #   (only on an unmount failure — diagnostic)
+fuser -mv /data/mongo                             #   (only on an unmount failure — diagnostic)
+tee /sys/block/<disk>/device/rescan               # STEP 5  rescan the re-pointed LUN
+blockdev --rereadpt /dev/<disk>                   #   (partprobe is the fallback)
+partprobe /dev/<disk>
+udevadm settle --timeout=15
+pvscan --cache                                    #   LVM: no-op on a single pRDM
+vgchange -ay                                      #   LVM: no-op on a single pRDM
+blkid -s TYPE -o value /dev/<part>                #   detect fs type for the RO integrity check
+xfs_repair -n /dev/<part>                         #   RO integrity check (xfs) ...
+e2fsck   -n -f /dev/<part>                         #   ... or ext2/3/4
+mount /data/mongo                                 # STEP 5  remount from fstab
+```
+
+### Example scoped `sudoers`
+
+Drop this on **every** node as `/etc/sudoers.d/mongo-backup` (owner `root`, mode `0440`; always validate with
+`visudo -cf /etc/sudoers.d/mongo-backup` before trusting it). Replace `backup` with your `SSH_USER`, and fix
+the binary paths for your distro — find them with `command -v systemctl pkill umount mount blockdev partprobe udevadm pvscan vgchange blkid xfs_repair e2fsck lsof fuser tee`:
+
+```sudoers
+# Passwordless sudo for the mongodb-flasharray-backup SSH user, scoped to what restore runs.
+Cmnd_Alias MONGO_RESTORE = \
+    /usr/bin/systemctl stop mongodb-mms-automation-agent, \
+    /usr/bin/systemctl start mongodb-mms-automation-agent, \
+    /usr/bin/pkill -TERM -x mongod, /usr/bin/pkill -KILL -x mongod, \
+    /usr/bin/pkill -TERM -x mongos, /usr/bin/pkill -KILL -x mongos, \
+    /usr/bin/umount /data/mongo, /usr/bin/mount /data/mongo, \
+    /usr/bin/lsof +f -- /data/mongo, /usr/bin/fuser -mv /data/mongo, \
+    /usr/bin/tee /sys/block/*/device/rescan, \
+    /usr/sbin/blockdev --rereadpt /dev/*, /usr/sbin/partprobe /dev/*, \
+    /usr/bin/udevadm settle --timeout=15, \
+    /usr/sbin/pvscan --cache, /usr/sbin/vgchange -ay, \
+    /usr/sbin/blkid -s TYPE -o value /dev/*, \
+    /usr/sbin/xfs_repair -n /dev/*, /usr/sbin/e2fsck -n -f /dev/*
+
+backup ALL=(root) NOPASSWD: MONGO_RESTORE
+```
+
+> **How the matching works:** `sudo` matches the resolved command path **and its arguments**. The fixed
+> commands must match exactly (they're constant in the tool), and the `/dev/*` / `/sys/block/*` wildcards cover
+> the per-node device names. Verify with `sudo -ln` as `SSH_USER` — the `MONGO_RESTORE` entries should list.
+> If your `xfs_repair`/`e2fsck`/`blockdev` live in `/sbin` rather than `/usr/sbin`, adjust (or symlink) — a
+> path mismatch makes that one command fall through to a password prompt and stall the restore.
+
+> **Cross-cluster restore (`restore-mongo-snapshot-to-target`, cert 1.A.1.b) needs more.** In addition to the
+> above it runs `find`, `mkdir -p`, `chown`, `grep`, `awk`, `tee`, and `sudo -u <mongod-user> mongod …` (an
+> offline `local.system.replset` rewrite). If you use that command, grant those too — or just use blanket
+> `NOPASSWD: ALL` on the throwaway target host.
 
 ---
 
