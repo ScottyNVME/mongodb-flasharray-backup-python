@@ -209,7 +209,7 @@ MongoDB I/O is **never blocked or frozen** at any point. This is the key advanta
 | FA snapshot | ✅ Normal | FlashArray snapshot is a pointer redirect at the storage layer — microseconds; applications see no pause |
 | `FINISHING` | ✅ Normal | Ops Manager closes the backup cursor; WiredTiger checkpoint pin released |
 
-Crash consistency is guaranteed because `$backupCursor` ensures the pinned checkpoint is internally consistent on each node. The FlashArray PG snapshot is taken per-array via `-ContextName`; the checkpoint is pinned on all nodes before any array is snapshotted and remains pinned until `/finish` is called after all arrays are done.
+`$backupCursor` makes the **cursor-pinned member's** on-disk checkpoint internally consistent. **The cursor is opened on only one member per replica set** — the snapshotable secondary passed in `nodeIds` — **not** on every member; the other members are never frozen and keep replicating through the `READY` window. The FlashArray PG snapshot (taken per-array via `-ContextName`) nonetheless captures **every** member's volume, so each replica set's snapshot set is *one cursor-pinned member plus the rest captured live*. On restore the cluster reverts **as a whole** and the members reconcile via the oplog — which is why the primary must retain oplog spanning the snapshot→revert gap (see [Whole-cluster revert and the oplog-window requirement](#whole-cluster-revert-and-the-oplog-window-requirement) below). The cursor stays open from `/start` until `/finish`.
 
 > **Hard requirement — one node's volumes must all be on one array.** A FlashArray PG snapshot is atomic
 > **only within a single array**; the per-array snapshots in a run are *separate* point-in-time captures that
@@ -267,7 +267,9 @@ The member with the freshest optime winning is an *emergent consequence* of rule
 
 **What this means for this integration.** With **equal priority** across members, all members **up and mutually reachable before the election settles**, and no arbiter/zero-vote members, the freshest-optime member wins in practice — because no other eligible member can out-vote it. That recovery point is that member's snapshot instant; the others roll forward or roll back to converge on it. This is a defensible claim *only given those preconditions*.
 
-**If a deterministic recovery point is required,** do not rely on the freshest-optime tendency. Pin the winner with `priority`, or bring one designated member up first and hold the others back. The restore flow today does not set member priority or enforce startup ordering, so the guaranteed statement is: *the set elects a freshest-eligible member; determinism requires equal priority and all members present before the election completes.*
+**If a deterministic recovery point is required,** do not rely on the freshest-optime tendency. Pin the winner with `priority`, or bring one designated member up first and hold the others back. The in-place restore (`restore.py`) does neither: STEP 6 starts every node's automation agent **in parallel** (`invoke_parallel_or_throw(cluster_nodes, _step6_start_agent, ...)`) and there is no `priority`/`votes`/reconfig manipulation anywhere in the flow — it starts everything and lets MongoDB elect. So the guaranteed statement is: *the set elects a freshest-eligible member; determinism requires equal priority and all members present before the election completes.*
+
+> The **cross-cluster** restore (`restore_to_target.py`) is different: it rewrites the seed member offline to a single-member config with `priority:1, votes:1` so the seed self-elects before the wiped members initial-sync from it. That is a seed + initial-sync flow, not the whole-cluster revert described here, and its determinism comes from the seed being alone at election time — not from priority steering of a live multi-member set.
 
 ---
 
