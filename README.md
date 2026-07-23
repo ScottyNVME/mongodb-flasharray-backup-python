@@ -23,7 +23,26 @@ dive.
 
 ---
 
-> **New here?** Follow [QUICKSTART.md](QUICKSTART.md) for a step-by-step setup → snapshot → restore walkthrough.
+## Quick start
+
+New here? The full step-by-step walkthrough is in **[GETTING-STARTED.md](GETTING-STARTED.md)**. The short
+version, once the [prerequisites](GETTING-STARTED.md#0-before-you-begin--prerequisites) are in place:
+
+```bash
+git clone https://github.com/ScottyNVME/mongodb-flasharray-backup-python.git
+cd mongodb-flasharray-backup-python
+python3 -m venv .venv && source .venv/bin/activate && pip install -e .
+
+cp .env.example .env                      # fill in FlashArray + Ops Manager + SSH details (see the guide)
+initialize-protection-groups --what-if    # sanity-check connectivity...
+initialize-protection-groups              # ...then apply (one-time)
+
+new-mongo-snapshot                         # prints a tag, e.g. om-20260512-143022
+restore-mongo-snapshot --snapshot-tag om-20260512-143022 --force
+```
+
+Append `--deployment <name>` to target a non-default deployment. For point-in-time recovery, retention, and
+troubleshooting, follow **[GETTING-STARTED.md](GETTING-STARTED.md)**.
 
 ## Install
 
