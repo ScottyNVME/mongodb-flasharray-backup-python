@@ -243,6 +243,25 @@ STEP 7: poll until all shard primaries elect
 
 Every FA snapshot taken inside the `$backupCursor` window is therefore guaranteed recoverable by WiredTiger on restart.
 
+### What opening the backup cursor actually does (per node)
+
+`$backupCursor` (opened by `POST /snapshot/start` on the `nodeIds`) is a **node-local, storage-engine operation** — it copies nothing; it pins state and enumerates files. On the node it's opened on, WiredTiger:
+
+- **Pins a checkpoint as the backup's point-in-time.** WiredTiger checkpoints roughly every 60 s; opening the cursor fixes the most recent durable checkpoint as the backup image (a checkpoint is by definition an internally-consistent snapshot of every table).
+- **Retains that checkpoint's blocks (copy-on-write).** While the cursor is open the block manager will not reclaim the pinned checkpoint's extents, even as the system keeps taking new checkpoints — **new writes land in new blocks**, so the on-disk image the FlashArray snapshot captures is a stable point-in-time even though the database keeps mutating.
+- **Freezes journal (WT log) cleanup** so the log files needed to replay forward from the checkpoint aren't removed.
+- **Returns metadata + a file list** — the first document carries a `backupId` and the backup's timestamps (checkpoint / oplog range); the rest list the files that constitute the backup (`collection-*.wt`, `index-*.wt`, `_mdb_catalog.wt`, the `WiredTiger*` metadata, journal files, and `local.oplog.rs`). A file-copy backup would copy those; **this integration instead snapshots the volume while the cursor is held**, so the "copy" is a microsecond FlashArray CoW redirect.
+
+**It does not freeze I/O.** This is not `fsyncLock` — no write stall, no lock, no quiesce; reads and writes continue throughout. Consistency comes from the pinned checkpoint + CoW, not from stopping traffic. The real cost is **space/overhead, not availability**: while the cursor is open the pinned checkpoint's blocks can't be freed and journal accumulates, so holding it briefly matters — the tool opens at `READY`, takes the FA snapshot, and closes at `/finish`.
+
+**It is per-node.** The cursor pins only the node it is opened on. A cluster backup is therefore *N* independent cursors — one per replica set (each shard + the config RS) — and `$backupCursorExtend(backupId, timestamp)` extends each to a common cluster timestamp so all shards are recoverable to the same point (alignment is at RS granularity). Members whose cursors are *not* opened keep replicating untouched — which is exactly why restore is a whole-cluster revert (below).
+
+### Which node the cursor opens on — the primary
+
+This implementation opens the backup cursor on the **primary** of each replica set (the `nodeIds` passed to `/snapshot`), and — matching it — points the PITR oplog tailer's `preferredOplogNodes` at the same primary. So per replica set, the **cursor-pinned consistent member and the oplog stream come from one authoritative node, at the freshest optime**. Selection falls back to a secondary only if the primary is not `snapshotable` / agent-reachable.
+
+**Tradeoff.** Because opening the cursor pins a checkpoint and holds journal on that node — and PITR then also captures/`scp`s the oplog from it — the backup-window **overhead lands on the write-serving primary**. There is **no I/O freeze** on the primary (see above); the cost is the extra retention + journal growth + oplog-capture read for the cursor window. (The earlier default preferred a *secondary* precisely to keep that overhead off the primary; sourcing from the primary is a deliberate choice to make the snapshot's pinned point and the oplog stream a single authoritative source.)
+
 ### Whole-cluster revert and the oplog-window requirement
 
 The restore overwrites **every** member's volume from its own snapshot and brings the whole replica set / cluster back at once. Because the members were captured at slightly different oplog positions (only the `$backupCursor` node is frozen; the others are replicating during the window), they reconcile to a common point via **normal MongoDB replication/rollback** after restart — exactly as a member that was briefly offline would.
