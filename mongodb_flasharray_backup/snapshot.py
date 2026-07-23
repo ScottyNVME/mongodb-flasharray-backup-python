@@ -237,9 +237,9 @@ def _run(
         config.write_host("  All data volumes confirmed as PG members.", fg=config.GREEN)
         # endregion
 
-        # region --- STEP 1: Select snapshotable nodes (one secondary per shard) ---
+        # region --- STEP 1: Select snapshotable nodes (the primary per shard) ---
         config.write_host(
-            "\n=== STEP 1: Selecting snapshotable nodes (one secondary per shard) ===", fg=config.YELLOW
+            "\n=== STEP 1: Selecting snapshotable nodes (the primary per shard) ===", fg=config.YELLOW
         )
 
         # ClusterDetail was already fetched in STEP 0 pre-flight.
@@ -272,24 +272,24 @@ def _run(
 
         for RS in replica_sets:
             # Snapshotable candidates whose automation agent is confirmed running.
-            # Priority: hidden secondary > secondary > primary.
+            # Open the backup cursor on the PRIMARY (highest-optime member) so the cursor-pinned, consistent
+            # snapshot is the freshest point in the RS. Fall back to a secondary only if the primary is not
+            # snapshotable/agent-reachable. NOTE: pinning the checkpoint on the primary adds backup-window
+            # overhead (checkpoint retention + journal growth) to the write-serving node — an accepted trade.
             Candidates = [
                 n for n in (RS.get("nodes") or [])
                 if n.get("snapshotable") is True and _agent_active(n)
             ]
-            Chosen = next(
-                (n for n in Candidates if n.get("memberState") == "SECONDARY" and n.get("hidden") is True),
-                None,
-            )
+            Chosen = next((n for n in Candidates if n.get("memberState") == "PRIMARY"), None)
             if not Chosen:
                 Chosen = next((n for n in Candidates if n.get("memberState") == "SECONDARY"), None)
             if not Chosen:
-                Chosen = Candidates[0] if Candidates else None  # agent-reachable primary fallback
+                Chosen = Candidates[0] if Candidates else None  # any agent-reachable snapshotable member
             if not Chosen:
                 raise RuntimeError(
                     f"No snapshotable node with a reachable automation agent for replica set "
                     f"{RS.get('id')}. Refusing to open a backup cursor on a host whose agent is down "
-                    "(the snapshot job would stall). Restart the agent or wait for a healthy secondary."
+                    "(the snapshot job would stall). Restart the agent or wait for a healthy primary."
                 )
             NodeIds.append(Chosen.get("id"))
             config.write_host(

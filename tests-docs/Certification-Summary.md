@@ -53,7 +53,7 @@ Each node's `/data/mongo` is a FlashArray volume in a Fusion fleet.
 Per-member snapshot + **whole-cluster revert**: every member is restored from its own snapshot and the cluster
 comes back together, reconciling via normal replication on restart. **Operational requirement:** the primary
 must retain **enough oplog to span the snapshot→revert-point gap**, or a lagging member hits
-`OplogStartMissing`. Back up from a low-lag secondary to keep that spread small.
+`OplogStartMissing`. Keep replication lag low and the oplog large so members reconcile within the window.
 
 ## Operational runbook (field-tested gotchas)
 

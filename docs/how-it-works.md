@@ -133,7 +133,7 @@ Because FlashArray takes volume-level snapshots, the `fileList` / `fileDiffs` st
 1. GET  /group/{groupId}/clusters/{clusterId}
          → identify snapshotable nodes from the cluster detail's replicaSets
            (one per shard + config RS for a sharded cluster; the single RS for a replica set)
-         → select: hidden secondary > secondary > primary; prefer most recent opTime
+         → select: the primary (fall back to a secondary if the primary isn't snapshotable/reachable)
 
 2. POST /group/{groupId}/clusters/{clusterId}/snapshot
          body: { "nodeIds": ["aen-mongo-01:27020", "aen-mongo-01:27021", ...],
@@ -169,7 +169,7 @@ Because FlashArray takes volume-level snapshots, the `fileList` / `fileDiffs` st
 1. `snapshotable: true` — mandatory
 2. Previously snapshotted nodes — enables incremental
 3. Most recent `opTime` — aligns shard timestamps
-4. Hidden secondary > secondary > primary — minimizes production impact
+4. **Primary** (highest-optime member); fall back to a secondary if the primary isn't snapshotable/agent-reachable
 
 ### Topology requirements (sharded *and* replica set)
 
@@ -209,7 +209,7 @@ MongoDB I/O is **never blocked or frozen** at any point. This is the key advanta
 | FA snapshot | ✅ Normal | FlashArray snapshot is a pointer redirect at the storage layer — microseconds; applications see no pause |
 | `FINISHING` | ✅ Normal | Ops Manager closes the backup cursor; WiredTiger checkpoint pin released |
 
-`$backupCursor` makes the **cursor-pinned member's** on-disk checkpoint internally consistent. **The cursor is opened on only one member per replica set** — the snapshotable secondary passed in `nodeIds` — **not** on every member; the other members are never frozen and keep replicating through the `READY` window. The FlashArray PG snapshot (taken per-array via `-ContextName`) nonetheless captures **every** member's volume, so each replica set's snapshot set is *one cursor-pinned member plus the rest captured live*. On restore the cluster reverts **as a whole** and the members reconcile via the oplog — which is why the primary must retain oplog spanning the snapshot→revert gap (see [Whole-cluster revert and the oplog-window requirement](#whole-cluster-revert-and-the-oplog-window-requirement) below). The cursor stays open from `/start` until `/finish`.
+`$backupCursor` makes the **cursor-pinned member's** on-disk checkpoint internally consistent. **The cursor is opened on only one member per replica set** — the primary (the member passed in `nodeIds`) — **not** on every member; the other members are never frozen and keep replicating through the `READY` window. The FlashArray PG snapshot (taken per-array via `-ContextName`) nonetheless captures **every** member's volume, so each replica set's snapshot set is *one cursor-pinned member plus the rest captured live*. On restore the cluster reverts **as a whole** and the members reconcile via the oplog — which is why the primary must retain oplog spanning the snapshot→revert gap (see [Whole-cluster revert and the oplog-window requirement](#whole-cluster-revert-and-the-oplog-window-requirement) below). The cursor stays open from `/start` until `/finish`.
 
 > **Hard requirement — one node's volumes must all be on one array.** A FlashArray PG snapshot is atomic
 > **only within a single array**; the per-array snapshots in a run are *separate* point-in-time captures that
@@ -247,7 +247,7 @@ Every FA snapshot taken inside the `$backupCursor` window is therefore guarantee
 
 The restore overwrites **every** member's volume from its own snapshot and brings the whole replica set / cluster back at once. Because the members were captured at slightly different oplog positions (only the `$backupCursor` node is frozen; the others are replicating during the window), they reconcile to a common point via **normal MongoDB replication/rollback** after restart — exactly as a member that was briefly offline would.
 
-**Operational requirement (confirmed with MongoDB):** this reconciliation only succeeds while the elected primary still holds **enough oplog to span the gap between the snapshot point and the revert point**. If the oplog window is shorter than that spread, a lagging member finds no common point and hits `OplogStartMissing` (→ resync/rollback failure). So size the oplog comfortably larger than the replication lag present at snapshot time (and than any snapshot→restore delta you intend to land on). Backing up from a low-lag, low-traffic secondary — the default node-selection preference — keeps this spread small.
+**Operational requirement (confirmed with MongoDB):** this reconciliation only succeeds while the elected primary still holds **enough oplog to span the gap between the snapshot point and the revert point**. If the oplog window is shorter than that spread, a lagging member finds no common point and hits `OplogStartMissing` (→ resync/rollback failure). So size the oplog comfortably larger than the replication lag present at snapshot time (and than any snapshot→restore delta you intend to land on). Keeping replication lag low keeps that spread small (the snapshot's cursor pins the primary; the secondaries trail it by their replication lag at snapshot time).
 
 ### How the primary is elected after a restore
 

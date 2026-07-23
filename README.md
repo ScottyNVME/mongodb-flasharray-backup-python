@@ -11,7 +11,7 @@ Each MongoDB node's data volume lives on a FlashArray, and the arrays are enroll
 fleet. The toolkit talks to the arrays over the **FlashArray REST API**, connecting **directly to each fleet
 member** (`fa_rest.py`) and authenticating fleet-wide with a directory account (`FA_USERNAME`/`FA_PASSWORD`) so
 every array is reachable. `new-mongo-snapshot` uses the Ops Manager Third-Party Backup API to open a
-`$backupCursor` on one snapshotable secondary per replica set — each shard's RS for a sharded cluster, or the
+`$backupCursor` on the primary of each replica set — each shard's RS for a sharded cluster, or the
 single RS for a standalone replica set (pinning the WiredTiger checkpoint and freezing journal cleanup);
 while the cursor is open, a FlashArray protection-group snapshot is taken on every array in a coordinated
 crash-consistent sweep — no `fsyncLock`, no write stall. `restore-mongo-snapshot` stops agents, unmounts,

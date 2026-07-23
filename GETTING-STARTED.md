@@ -7,8 +7,8 @@ bottom; you shouldn't need to ask anyone. Budget ~30 minutes the first time (mos
 New here, want the 60-second version? See the **Quick start** in [README.md](README.md#quick-start). Want to
 understand *why* it's crash-consistent? See [docs/how-it-works.md](docs/how-it-works.md).
 
-> **The 30-second mental model:** Ops Manager opens a `$backupCursor` on one snapshotable secondary per replica
-> set (each shard, or the single RS — pinning a consistent point), and while it's held, the tool takes a
+> **The 30-second mental model:** Ops Manager opens a `$backupCursor` on the primary of each replica set
+> (each shard, or the single RS — pinning a consistent point), and while it's held, the tool takes a
 > FlashArray protection-group snapshot on every array at once. Restore overwrites each node's volume from that
 > snapshot in place; WiredTiger crash-recovers on restart. No `fsyncLock`, no write stall.
 
@@ -219,7 +219,7 @@ changes (a node or array added/removed); it's idempotent. Use `--prune` to drop 
 new-mongo-snapshot
 ```
 
-What happens: pre-flight health checks → selects one snapshotable secondary per shard → opens the OM
+What happens: pre-flight health checks → selects the primary per shard → opens the OM
 `$backupCursor` → takes a coordinated FlashArray PG snapshot on every array → closes the cursor. **Let it run
 to completion** (don't interrupt it). At the end it prints the **snapshot tag**, e.g.:
 

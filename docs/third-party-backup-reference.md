@@ -153,7 +153,7 @@ Use the API keys from Step 2 to integrate your third-party backup software via t
 | 1 | `snapshotable: true` — mandatory |
 | 2 | Previously snapshotted nodes — enables incremental |
 | 3 | Most recent `opTime` — aligns shard timestamps |
-| 4 | Hidden secondary > secondary > primary — minimizes production impact |
+| 4 | **Primary** (highest-optime member); secondary fallback if the primary isn't snapshotable/reachable |
 | 5 | Nodes in the region where you want the snapshot stored |
 
 **Flow:**
