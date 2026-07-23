@@ -119,6 +119,11 @@ See [.env.example](.env.example) for a worked two-deployment example.
 - A data volume per node mounted at `/data/mongo`. A single direct volume (pRDM) is the **live-validated**
   layout; LVM-over-multipath (a VG spanning several FlashArray volumes) is **supported** by discovery, tagging
   and restore but is not yet validated on live hardware.
+- **Hard requirement — a node's data volumes must all live on the *same* FlashArray.** FlashArray
+  protection-group snapshots are atomic only **per array**; the per-array snapshots in one run fire
+  independently, so a node whose volumes span two arrays cannot be captured crash-consistently (its LVM/VG
+  image would be torn across non-atomic snapshots). Single-volume (pRDM) nodes satisfy this trivially; for a
+  multi-volume LVM node, keep every PV of its VG on one array.
 
 ---
 
@@ -213,7 +218,8 @@ and the latest live run in [tests-docs/Test-Certification-Results-2026-07-22.md]
   precomputed and stored as copyable FlashArray volume tags** by `initialize-protection-groups` (re-run it
   after a topology change); snapshot/restore then read the tags (one `GET /volumes/tags` per array, **no
   per-node SSH**), verify each volume's serial, and fall back to live SCSI/LVM discovery only for an
-  untagged/stale node. Handles single-volume **and** multi-volume (LVM-over-multipath) mounts. **Volume
+  untagged/stale node. Handles single-volume **and** multi-volume (LVM-over-multipath) mounts — but a node's
+  volumes must all sit on **one** array (crash-consistency is per-array; see Prerequisites). **Volume
   moves between arrays** are handled by serial — the owning array is derived, never hard-coded: a moved
   volume resolves directly if its tags travelled, self-heals via SSH rediscovery if a tag is lost/stale, and
   a `mongo:pvcount` guard refuses an incomplete multi-volume set — so a move yields a correct result or a

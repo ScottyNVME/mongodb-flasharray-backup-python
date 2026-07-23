@@ -21,6 +21,10 @@ These are one-time and usually provisioned by an admin. Confirm each before cont
 - [ ] **A MongoDB 8.0 sharded cluster *or* standalone replica set** managed by **Ops Manager 8.0**, with
       `/data/mongo` on a **FlashArray** volume (a single direct pRDM is the validated layout; LVM-over-multipath
       is supported but not yet live-validated) — every array enrolled in the same **Pure Storage Fusion fleet**.
+- [ ] **Hard requirement: all volumes backing a single node must be on the *same* FlashArray.** FlashArray
+      snapshots are crash-consistent only *per array*, so a node whose data volumes span two arrays can't be
+      snapshotted consistently. A single-volume (pRDM) node meets this automatically; for an LVM node, keep
+      every PV of its volume group on one array.
 - [ ] **Ops Manager third-party backup enabled** and the cluster **registered / `ACTIVE`**
       (see [docs/third-party-backup-reference.md](docs/third-party-backup-reference.md), Steps 1–7). *For a
       replica set, register it via the third-party `…/clusters/{id}/manage` endpoint — no OM snapshot store is

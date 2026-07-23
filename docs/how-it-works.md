@@ -211,6 +211,15 @@ MongoDB I/O is **never blocked or frozen** at any point. This is the key advanta
 
 Crash consistency is guaranteed because `$backupCursor` ensures the pinned checkpoint is internally consistent on each node. The FlashArray PG snapshot is taken per-array via `-ContextName`; the checkpoint is pinned on all nodes before any array is snapshotted and remains pinned until `/finish` is called after all arrays are done.
 
+> **Hard requirement — one node's volumes must all be on one array.** A FlashArray PG snapshot is atomic
+> **only within a single array**; the per-array snapshots in a run are *separate* point-in-time captures that
+> fire independently (a few milliseconds apart). That's fine because each node's data lives entirely on one
+> array, so that node's image is captured atomically. If a single node's data volumes were split **across two
+> arrays** (e.g. an LVM VG with PVs on different arrays), the two arrays' snapshots would not be mutually
+> atomic — the VG/filesystem image would be torn between two non-simultaneous point-in-time captures and may
+> be unrecoverable. So **every volume backing a given node must reside on the same FlashArray.** (Different
+> nodes on different arrays is expected and fine; the constraint is per-node.)
+
 ---
 
 ## Why `$backupCursor` Makes Every Snapshot Recoverable
