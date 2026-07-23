@@ -117,3 +117,43 @@ write concern configured in its own `clusterWideConfigurations` (schema undocume
 into a PUT on the shared prod project). **Finding:** adding an arbiter to an OM-managed RS (FCV ≥ 5.0) is
 gated on configuring OM's cluster-wide DefaultWriteConcern first — a real operational prerequisite for the
 arbiter cert item. `aen-rs-00` was returned to its clean 3-member state (no membership change persisted).
+
+---
+
+## Primary-sourced backup + PITR — end-to-end live verification (2026-07-23)
+
+After switching **both** the snapshot backup cursor and the oplog tailer to prefer the **PRIMARY**
+(`snapshot.py` STEP 1 and `start_oplog_tailer.py` node selection), re-validated a full PITR cycle on
+`aen-rs-00` (tag `om-20260723-183000`) to confirm the primary-sourced stream behaves end-to-end.
+
+**Primary selection confirmed from OM's own log** (`mms0.log`): for `aen-rs-00` the WiredTiger
+`checkpointingTarget`, the snapshot `hostnameAndPort`, and the `oplogTailTarget` (`tailOwnerSince
+2026-07-23T18:13:06Z`) are all **`aen-mongo-06.fsa.lab:27017` — the PRIMARY**. The tailer log likewise shows
+`tailing on aen-mongo-06 [PRIMARY]` and `Preferred oplog nodes set: aen-mongo-06`, with each oplog `.oplogs`
+segment `scp`'d from the primary.
+
+**Deterministic PITR proof (markers in `pitrtest.marks`):**
+- **T1 snapshot** (cursor on primary): marker **A** present, **B** not yet written.
+- Insert **B** post-snapshot → tailer captures it from the primary (the `applied 1 oplog entries` segment).
+- **Restore → T1:** `A=1, B=0`, `testdb.loadtest=17000 (drift 0)` — correctly reverted to before B.
+- **Replay → T2:** `A=1, B=1` — B correctly recovered forward from the **primary-sourced** oplog.
+
+**Verdict: ✅ PASS.** The primary-sourced backup cursor and oplog stream complete a snapshot→restore→replay
+cycle end-to-end; a post-snapshot write (marker B) is reverted by the restore and recovered by the replay.
+
+### Findings from this run (worth carrying into the runbook / code)
+
+1. **`preferredOplogNodes` is refused (HTTP 500 `THIRD_PARTY_OPLOG_SNAPSHOT_IN_PROGRESS`) while an oplog
+   snapshot is in progress** — for *any* node, not just the primary. An orphaned in-progress oplog job (left
+   by earlier OM instability) wedges the tailer at its first step. **Recovery:** read the in-progress
+   `oplogSnapshotId` from the cluster detail (`GET .../clusters/{id}`), then drive it to `FINISHED`
+   (`POST /start` **from `INITIAL`** → poll `READY` → `POST /finish`). Note `/start` must be issued from
+   `INITIAL`; the job will not advance on its own.
+2. **Hardened** `start_oplog_tailer.py` to POST `preferredOplogNodes` via `invoke_om_api_with_retry` (was a
+   single `invoke_om_api`) — OM occasionally returns a transient 500 there, which previously aborted the
+   tailer before any oplog was captured. The call is idempotent, so retry is safe.
+3. **`--deployment` footgun:** `stop-oplog-tailer` and `invoke-oplog-replay` default to the **first/sharded**
+   deployment when `--deployment` is omitted. Omitting it made the T2 mark and a first replay target
+   `aen-cluster` instead of `aen-rs-00` (harmless here — the misdirected replay found no matching segments —
+   but it produced a misleading `unrecoveredTail` figure). Always pass `--deployment` on multi-deployment
+   installs. See [../docs/LESSONS.md](../docs/LESSONS.md).

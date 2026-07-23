@@ -222,8 +222,9 @@ def _run(
                 fg=config.CYAN,
             )
 
-        # Register preferred oplog nodes (idempotent)
-        config.invoke_om_api(
+        # Register preferred oplog nodes (idempotent). Use the retrying variant: OM occasionally returns a
+        # transient 500 here, and a single failure must not abort the tailer before any oplog is captured.
+        config.invoke_om_api_with_retry(
             method="POST",
             path=f"group/{group_id}/clusters/{cluster_id}/preferredOplogNodes",
             body={"nodeIds": list(tailing_node_ids)},
