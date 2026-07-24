@@ -94,6 +94,14 @@ def _run(
         "--deployment",
         help="Deployment name to back up (selects '<NAME>__' keys in .env). Omit to use the flat keys.",
     ),
+    # --skip-balancer-stop (sharded only): leave the balancer running during the snapshot. UNSAFE.
+    skip_balancer_stop: bool = typer.Option(
+        False,
+        "--skip-balancer-stop",
+        help="Sharded only: do NOT stop the balancer for the snapshot. UNSAFE — $backupCursor does not "
+        "pause chunk migrations, so an in-flight migration can make the independently-taken per-shard "
+        "snapshots mutually inconsistent. Default: stop the balancer, then restore its prior state.",
+    ),
 ) -> None:
     # Load .env FIRST (raises if missing) so all configuration is available before any work begins.
     config.load_config(deployment=deployment)
@@ -116,6 +124,9 @@ def _run(
     SnapshotId = None
     FaSnapshots: list = []
     transcript_logger: Optional[logging.Logger] = None
+    # Sharded balancer: prior enabled/disabled state, set only when we actually stop it, used to restore
+    # it in the outer finally. Stays None for replica sets and when --skip-balancer-stop is passed.
+    BalancerWasEnabled: Optional[bool] = None
 
     try:
         # Verify that third-party backup is ACTIVE on this cluster before opening a backup cursor.
@@ -329,6 +340,55 @@ def _run(
         )
         SnapshotId = CreateResponse.get("snapshotId")
         config.write_host(f"  Snapshot job created: {SnapshotId}", fg=config.GREEN)
+
+        # region --- STEP 3.5: Quiesce the balancer before opening the cursor (sharded only) ---
+        # $backupCursor is a per-node checkpoint pin — it does NOT pause chunk migrations. Because each
+        # shard is snapshotted independently, an in-flight migration during the FA snapshots can capture a
+        # chunk on both/neither shard, or leave shard data disagreeing with the config metadata. Stop the
+        # balancer (sh.stopBalancer drains any in-progress round) before /start, and restore the prior
+        # state in the outer finally. Replica sets have no balancer, so this is skipped there.
+        MongosUri = f"mongodb://{cfg.MongosHost}:{cfg.MongosPort}"
+        if cfg.Topology == "sharded" and not skip_balancer_stop:
+            config.write_host(
+                "  Quiescing balancer before opening the backup cursor (sharded)...", fg=config.CYAN
+            )
+            try:
+                StateRaw = config.invoke_mongosh_js(
+                    cfg.MongosHost, MongosUri, "print(sh.getBalancerState())",
+                    max_attempts=3, context="getBalancerState",
+                )
+                BalancerWasEnabled = "true" in (StateRaw or "").lower()
+                # stopBalancer(timeout_ms, interval_ms) disables balancing AND blocks until any in-progress
+                # balancing round drains, so no migration is mid-flight when the cursor opens.
+                config.invoke_mongosh_js(
+                    cfg.MongosHost, MongosUri, "sh.stopBalancer(300000, 1000)",
+                    max_attempts=3, context="stopBalancer",
+                )
+                Confirm = config.invoke_mongosh_js(
+                    cfg.MongosHost, MongosUri, "print(sh.getBalancerState())",
+                    max_attempts=3, context="getBalancerState",
+                )
+                if "true" in (Confirm or "").lower():
+                    raise RuntimeError("balancer still reports enabled after sh.stopBalancer()")
+                config.write_host(
+                    f"  Balancer stopped (prior state: "
+                    f"{'enabled' if BalancerWasEnabled else 'disabled'}); no in-flight migration.",
+                    fg=config.GREEN,
+                )
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"Could not stop the balancer via mongos {cfg.MongosHost}: {e}. Refusing to snapshot a "
+                    "sharded cluster with the balancer active — in-flight chunk migrations make the "
+                    "per-shard snapshots mutually inconsistent. Fix mongos connectivity or pass "
+                    "--skip-balancer-stop to override (unsafe)."
+                )
+        elif cfg.Topology == "sharded" and skip_balancer_stop:
+            config.write_host(
+                "  WARNING: --skip-balancer-stop set — snapshotting with the balancer AS-IS; in-flight "
+                "chunk migrations may make the per-shard snapshots inconsistent.",
+                fg=config.YELLOW,
+            )
+        # endregion
 
         config.write_host("  Starting snapshot (opens $backupCursor on each node)...", fg=config.CYAN)
         config.invoke_om_api(
@@ -684,6 +744,22 @@ def _run(
                 pass
 
     finally:
+        # Restore the balancer to its prior state once the cursor is closed/failed (only if WE stopped an
+        # enabled balancer; a balancer that was already disabled is left disabled). Runs on success, on
+        # errors, and on Ctrl-C — a snapshot must never leave the balancer permanently off.
+        if BalancerWasEnabled:
+            try:
+                config.invoke_mongosh_js(
+                    cfg.MongosHost, f"mongodb://{cfg.MongosHost}:{cfg.MongosPort}",
+                    "sh.startBalancer()", max_attempts=3, context="startBalancer",
+                )
+                config.write_host("  Balancer re-enabled (restored prior state).", fg=config.GREEN)
+            except Exception as e:  # noqa: BLE001
+                config.write_host(
+                    f"  WARNING: failed to re-enable the balancer: {e}. Re-enable it manually via mongos: "
+                    "sh.startBalancer()",
+                    fg=config.RED,
+                )
         # Release the concurrency lock regardless of outcome.
         config.remove_script_lock(LockPath)
 
