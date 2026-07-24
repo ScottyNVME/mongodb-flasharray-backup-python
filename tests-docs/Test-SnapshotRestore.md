@@ -1,11 +1,12 @@
 # Test: Snapshot and Restore
 
-Validates the end-to-end snapshot and restore flow for the `aen-cluster` sharded cluster.
+Validates the end-to-end snapshot and restore flow for both deployments: the `aen-cluster` sharded cluster
+(Tests 1–5) and the `aen-rs-00` standalone replica set (Tests 6–7).
 
-> **Replica-set deployments:** the same procedure applies to a standalone replica set — append `--deployment <name>`
-> to every `new-mongo-snapshot` / `restore-mongo-snapshot` call, and point the `mongosh` helper at an RS member
-> instead of `mongos`. A worked RS run (snapshot → mutate → restore → drift 0 with a sentinel-collection fidelity
-> check) is recorded in [Test-CertificationChecklist.md](Test-CertificationChecklist.md) §1.A.a.
+> **Replica-set deployments:** the same procedure applies to a standalone replica set — append
+> `--deployment aen-rs-00` to every command and point `mongosh` at an RS member instead of `mongos`. Fully worked
+> RS runs are in **Test 6** (self-restore, fidelity proof) and **Test 7** (PIT with A/B markers) below; Tests 1–3
+> and 4–5 use the sharded `aen-cluster`.
 
 > **Run each step manually in separate terminals.** Multi-stage workflows that combine a long-running background process (e.g. `start-insert-load`) with a foreground operation (e.g. `new-mongo-snapshot`) in the same pipeline will deadlock — the parent shell waits for stdout to drain before reading the next pipe stage, and both sides block. Each process must run in its own independent terminal with no shared pipe.
 
@@ -288,6 +289,321 @@ back to rsId if mongos is unreachable) and replay tolerates either layout. The v
 recovers across all three shards — leaving `unrecoveredTail=19,400`, which is now just the inherent stop-window
 (≈ `--interval-sec` × write-throughput ≈ one minute at ~330 docs/s), not a dropped shard. Shrink it further with a
 smaller `--interval-sec` or a brief quiesce before `stop-oplog-tailer`.
+
+---
+
+## Test 4 — Sharded self-restore, fidelity proof (mutate-then-restore)
+
+The count-window check in Tests 1–2 (`preSnap ≤ got ≤ postSnap`) passes even for a *no-op* restore — if the
+volumes were never actually reverted, the counts still match. This test proves a **true point-in-time revert** the
+same way the replica-set cert item (1.A.1.a) does: between snapshot and restore, **mutate** the data and add a
+**sentinel collection**, then confirm the restore both reverts the counts *and* makes the sentinel disappear. This
+is the sharded analogue of the RS fidelity proof and is the recommended way to run the sharded self-restore rows
+(2.A.a / 2.A.e).
+
+### Setup
+
+Run the session-setup block, then note the baseline (this is your expected post-restore count):
+
+```bash
+mongos 'var d=db.getSiblingDB("testdb"); print("loadtest="+d.loadtest.countDocuments()+" payload="+d.payload.countDocuments()+" sentinel="+d.sentinel.countDocuments())'
+```
+
+Expected: some `loadtest`/`payload` counts and `sentinel=0`.
+
+### Steps
+
+**1. Take a snapshot (T).**
+
+```bash
+new-mongo-snapshot --deployment aen-cluster --snapshot-tag "om-20260723-185500"
+```
+
+Snapshot tags must match `^om-\d{8}-\d{6}$` (no suffix). The tail prints the captured `preSnap`/`postSnap` counts.
+
+**2. Mutate: delete the data and write a sentinel that did not exist at snapshot time.**
+
+```bash
+mongos 'var d=db.getSiblingDB("testdb"); d.loadtest.deleteMany({}); d.payload.deleteMany({}); d.sentinel.insertOne({s:"diverge",t:new Date()}); print("MUTATED loadtest="+d.loadtest.countDocuments()+" payload="+d.payload.countDocuments()+" sentinel="+d.sentinel.countDocuments())'
+```
+
+Expected: `loadtest=0 payload=0 sentinel=1` — the on-disk state now differs from the snapshot in both directions
+(data removed *and* a new collection added).
+
+**3. Restore from the snapshot.**
+
+```bash
+restore-mongo-snapshot --deployment aen-cluster --snapshot-tag "om-20260723-185500" --force
+```
+
+**4. Confirm the sentinel is gone.**
+
+```bash
+mongos 'print("sentinel="+db.getSiblingDB("testdb").sentinel.countDocuments())'
+```
+
+### Expected Results
+
+- Restore completes; mongos up, all 4 shards registered, all primaries reachable.
+- STEP 8 reports `Baseline OK` with **drift 0** for `testdb.loadtest` and `testdb.payload` (reverted to the
+  snapshot counts), and the **per-shard** verification prints each shard's own counts and asserts their sum
+  accounts for the mongos aggregate (`sum ≥ routed total`).
+- Step 4 returns **`sentinel=0`** — the post-snapshot collection is gone, proving a real revert rather than a
+  no-op (the sentinel would survive a no-op restore).
+
+### Verified Results (2026-07-23, tag `om-20260723-185500`)
+
+| Metric | Value |
+|---|---|
+| Baseline / post-restore | `loadtest` 49,600 / `payload` 20,000, **drift 0** |
+| Mutation before restore | `loadtest` 0 / `payload` 0 / `sentinel` 1 |
+| Per-shard (STEP 8) | `aen-shard_1` 33,055 + `aen-shard_2` 16,545 = 49,600 (= mongos aggregate); `config`/`aen-shard_3` empty, noted not failed |
+| Sentinel after restore | **`sentinel=0`** (post-snapshot collection reverted away) |
+| Restore wall time | ~113 s (4 volumes, FA CoW overwrite) |
+
+---
+
+## Test 5 — Sharded PIT self-restore with deterministic markers (A/B)
+
+The sharded analogue of the RS PIT cert item (1.B.1.a). In addition to the count-window / `unrecoveredTail`
+assertion (Test 3), this test carries two **deterministic marker documents** through the cycle: **A** inserted
+*before* the snapshot and **B** inserted *after* it. A correct PIT restore lands at T1 with **A present, B absent**;
+a correct replay to T2 recovers **B**. The markers remove all ambiguity from a live/idle load generator — even if
+the bulk counts do not move, `B` reappearing after replay is proof the post-snapshot stream was captured and
+applied. Markers live in an unsharded `pitrtest.marks` collection (routed to the primary shard).
+
+> **Primary sourcing (2026-07-23):** both `start-oplog-tailer` and `new-mongo-snapshot` now target the **PRIMARY**
+> of each shard/RS. The tailer prints `tailing on <host> [PRIMARY]` per shard and sets `preferredOplogNodes`
+> accordingly. If OM returns HTTP 500 on `preferredOplogNodes`, an oplog snapshot is in progress — see the
+> skip-forward note below and [../docs/LESSONS.md](../docs/LESSONS.md).
+
+### Setup
+
+Start the tailer **before** the snapshot so `previousEnd` continuity covers the snapshot point (same rule as
+Test 3), and choose the tag you will use for the snapshot too:
+
+```bash
+# Terminal B — long-running, leave open until step 6
+start-oplog-tailer --deployment aen-cluster --snapshot-tag "om-20260723-191000"
+```
+
+Confirm it selects a **PRIMARY** for every shard and begins capturing current segments. If the sharded oplog
+cursor is **stale** (it drains a large backlog dated days ago, and the rapid `scp` may hit SSH `exit 255` →
+`/fail` → re-drain with no progress), stop the tailer and **skip-forward re-baseline** first: create one oplog
+snapshot spanning `[stale → now]`, `/start` it, then `/finish` it **without copying** — the cursor jumps to ~now
+(a prior `FAILED` tailer job does not block the fresh create). Then restart the tailer; it captures current
+segments immediately.
+
+### Steps
+
+**1. Insert marker A (pre-snapshot).**
+
+```bash
+mongos 'var m=db.getSiblingDB("pitrtest").marks; m.deleteMany({}); m.insertOne({m:"A",t:new Date()}); print("A="+m.countDocuments({m:"A"})+" B="+m.countDocuments({m:"B"}))'
+```
+
+**2. Take the snapshot (T1) with the same tag as the tailer.**
+
+```bash
+# Terminal C
+new-mongo-snapshot --deployment aen-cluster --snapshot-tag "om-20260723-191000"
+```
+
+**3. Insert marker B plus a batch of post-T1 documents (the recovery window).**
+
+```bash
+mongos 'var m=db.getSiblingDB("pitrtest").marks; m.insertOne({m:"B",t:new Date()}); var d=db.getSiblingDB("testdb"); var b=[]; for(var i=0;i<2000;i++){b.push({postT1:1,i:i})}; d.loadtest.insertMany(b); print("B="+m.countDocuments({m:"B"})+" loadtest="+d.loadtest.countDocuments())'
+```
+
+**4. Drain, then stop the tailer.** Keep tailing until the captured `lastEnd` passes the wall-clock of step 3
+(OM segments lag live writes by ~2–3 min — see Test 3's drain note), then:
+
+```bash
+stop-oplog-tailer --deployment aen-cluster --snapshot-tag "om-20260723-191000"
+```
+
+This writes `t2-mark.json` (the T2 upper bound).
+
+**5. Restore from the snapshot (T1).**
+
+```bash
+restore-mongo-snapshot --deployment aen-cluster --snapshot-tag "om-20260723-191000" --force
+```
+
+Then confirm the markers are at the T1 state:
+
+```bash
+mongos 'var m=db.getSiblingDB("pitrtest").marks; print("A="+m.countDocuments({m:"A"})+" B="+m.countDocuments({m:"B"})+" loadtest="+db.getSiblingDB("testdb").loadtest.countDocuments())'
+```
+
+**6. Replay all captured segments to advance to T2.**
+
+```bash
+invoke-oplog-replay --deployment aen-cluster --snapshot-tag "om-20260723-191000"
+```
+
+Then confirm marker B is recovered:
+
+```bash
+mongos 'var m=db.getSiblingDB("pitrtest").marks; print("A="+m.countDocuments({m:"A"})+" B="+m.countDocuments({m:"B"})+" loadtest="+db.getSiblingDB("testdb").loadtest.countDocuments())'
+```
+
+> **Always pass `--deployment`.** On this multi-deployment install, omitting it makes `stop-oplog-tailer` and
+> `invoke-oplog-replay` default to the sharded cluster's *sibling* deployment lookup and read the wrong T2 mark /
+> target the wrong cluster (a real footgun — see [../docs/LESSONS.md](../docs/LESSONS.md)).
+
+### Expected Results
+
+- **After restore (step 5):** counts at the T1 baseline (**drift 0**, per-shard STEP 8 sums to the aggregate),
+  and markers **`A=1 B=0`** — the cluster is exactly at the snapshot point, before B.
+- **After replay (step 6):** `invoke-oplog-replay` asserts `preSnap ≤ postReplay ≤ T2` per collection and prints
+  **`unrecoveredTail=0`** once the stream was drained; markers **`A=1 B=1`** — the post-snapshot write was
+  recovered forward across all shards.
+- Config-shard `NotWritablePrimary` warnings against `config.*` namespaces during replay are expected and not a
+  failure (see Test 3); user-data namespaces (`testdb.*`, `pitrtest.*`) replay normally.
+
+### Verified Results (2026-07-23, tag `om-20260723-191000`, primary-sourced)
+
+| Metric | Value |
+|---|---|
+| Tailer node selection | **PRIMARY** per shard (`shard_2→aen-mongo-01`, `shard_3→aen-mongo-03`, `config→aen-mongo-config-00`, `shard_1→aen-mongo-02`) |
+| Cursor re-baseline | skip-forward from stale → **70 s behind now** before the run |
+| A (pre-snapshot) / B (post-snapshot) | inserted; T1 `loadtest` 49,600 → +2,000 → 51,600 |
+| Post-restore (T1) | `loadtest` **49,600 (drift 0)**, markers **`A=1 B=0`** |
+| Post-replay (T2) | `loadtest` **51,600 `unrecoveredTail=0`**, `payload` 20,000 `unrecoveredTail=0`, markers **`A=1 B=1`** |
+| Gap markers | 0 |
+
+---
+
+## Test 6 — Replica-set self-restore, fidelity proof (mutate-then-restore)
+
+The replica-set analogue of Test 4 (cert item **1.A.1.a**), run against the standalone 3-member RS `aen-rs-00`
+(`aen-mongo-05/06/07`). Identical fidelity method — mutate + sentinel, then confirm the restore reverts both — but
+there is **no mongos**: point `mongosh` at an RS member, and node selection / STEP 7 use the `replicaset` branch
+(verify a writable primary, no `listShards`).
+
+An RS helper (uses the RS member host from `.env`; run the session-setup block first):
+
+```bash
+rs() {
+    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${AEN_RS_00__MONGOS_HOST}" \
+        "${MONGOSH_PATH} --quiet --eval '$1'"
+}
+```
+
+### Setup
+
+```bash
+rs 'var d=db.getSiblingDB("testdb"); print("loadtest="+d.loadtest.countDocuments()+" payload="+d.payload.countDocuments()+" sentinel="+d.sentinel.countDocuments())'
+```
+
+### Steps
+
+**1. Snapshot (T).** `new-mongo-snapshot --deployment aen-rs-00 --snapshot-tag "om-20260723-184500"`
+— STEP 1 opens the `$backupCursor` on the **primary** (confirmable in OM's log: `checkpointingTarget = <primary>`).
+
+**2. Mutate + sentinel.**
+
+```bash
+rs 'var d=db.getSiblingDB("testdb"); d.loadtest.deleteMany({}); d.payload.deleteMany({}); d.sentinel.insertOne({s:"diverge",t:new Date()}); print("MUTATED loadtest="+d.loadtest.countDocuments()+" payload="+d.payload.countDocuments()+" sentinel="+d.sentinel.countDocuments())'
+```
+
+**3. Restore.** `restore-mongo-snapshot --deployment aen-rs-00 --snapshot-tag "om-20260723-184500" --force`
+
+**4. Confirm the sentinel is gone** (the restore may elect a different primary; the helper targets any member):
+
+```bash
+rs 'var d=db.getSiblingDB("testdb"); print("loadtest="+d.loadtest.countDocuments()+" payload="+d.payload.countDocuments()+" sentinel="+d.sentinel.countDocuments())'
+```
+
+### Expected Results
+
+- Restore completes; STEP 7 reports `replica set up, primary elected: <host>` (no `listShards`); STEP 8 reports
+  **drift 0** for both collections (RS deployments skip the per-shard STEP 8 — the single RS *is* the aggregate).
+- Step 4 returns **`sentinel=0`** — true point-in-time revert, not a no-op.
+
+### Verified Results (2026-07-23, tag `om-20260723-184500`)
+
+| Metric | Value |
+|---|---|
+| Baseline / post-restore | `loadtest` 17,000 / `payload` 5,000, **drift 0** |
+| Mutation before restore | `loadtest` 0 / `payload` 0 / `sentinel` 1 |
+| Cursor node | primary `aen-mongo-06` (STEP 1) |
+| Primary after restore | `aen-mongo-05` (re-elected on restart — normal) |
+| Sentinel after restore | **`sentinel=0`** |
+| Restore wall time | ~71 s (3 volumes, FA CoW overwrite) |
+
+---
+
+## Test 7 — Replica-set PIT self-restore with deterministic markers (A/B)
+
+The replica-set analogue of Test 5 (cert item **1.B.1.a**), primary-sourced. Same A/B marker method; the tailer and
+replay use the `replicaset` branches (single RS, no `listShards`). **Prerequisite:** `SSH_USER` (e.g. `packer`)
+must be in the **`mongod` group** on every RS node so the tailer can `scp` the `640 mongod:mongod` `.oplogs`
+segments (`sudo usermod -aG mongod <ssh_user>`).
+
+### Setup
+
+```bash
+# Terminal B — long-running, leave open until step 6
+start-oplog-tailer --deployment aen-rs-00 --snapshot-tag "om-20260723-183000"
+```
+
+Confirm it prints `tailing on <host> [PRIMARY]` and `Preferred oplog nodes set: <primary>`. Re-baseline first with
+a skip-forward if the cursor is stale (same as Test 5).
+
+### Steps
+
+**1. Marker A (pre-snapshot).**
+
+```bash
+rs 'var m=db.getSiblingDB("pitrtest").marks; m.deleteMany({}); m.insertOne({m:"A",t:new Date()}); print("A="+m.countDocuments({m:"A"})+" B="+m.countDocuments({m:"B"}))'
+```
+
+**2. Snapshot (T1).** `new-mongo-snapshot --deployment aen-rs-00 --snapshot-tag "om-20260723-183000"`
+
+**3. Marker B + a batch of post-T1 documents.**
+
+```bash
+rs 'var m=db.getSiblingDB("pitrtest").marks; m.insertOne({m:"B",t:new Date()}); var d=db.getSiblingDB("testdb"); var b=[]; for(var i=0;i<2000;i++){b.push({postT1:1,i:i})}; d.loadtest.insertMany(b); print("B="+m.countDocuments({m:"B"})+" loadtest="+d.loadtest.countDocuments())'
+```
+
+**4. Drain, then stop.** Wait until the tailer's captured `lastEnd` passes step 3's wall-clock, then
+`stop-oplog-tailer --deployment aen-rs-00 --snapshot-tag "om-20260723-183000"`.
+
+**5. Restore (T1)** — `restore-mongo-snapshot --deployment aen-rs-00 --snapshot-tag "om-20260723-183000" --force`
+— then confirm `A=1 B=0`:
+
+```bash
+rs 'var m=db.getSiblingDB("pitrtest").marks; print("A="+m.countDocuments({m:"A"})+" B="+m.countDocuments({m:"B"})+" loadtest="+db.getSiblingDB("testdb").loadtest.countDocuments())'
+```
+
+**6. Replay to T2** — `invoke-oplog-replay --deployment aen-rs-00 --snapshot-tag "om-20260723-183000"` — then
+confirm B is recovered (`A=1 B=1`) with the same `rs '…marks…'` eval.
+
+> **Always pass `--deployment aen-rs-00`** on `stop-oplog-tailer` and `invoke-oplog-replay` — omitting it defaults
+> to the sibling (sharded) deployment and reads the wrong T2 mark / targets the wrong cluster (see
+> [../docs/LESSONS.md](../docs/LESSONS.md)).
+
+### Expected Results
+
+- **After restore:** `loadtest` at the T1 baseline (**drift 0**), markers **`A=1 B=0`**.
+- **After replay:** `preSnap ≤ postReplay ≤ T2` with **`unrecoveredTail=0`** once drained, markers **`A=1 B=1`** —
+  the post-snapshot write recovered from the **primary-sourced** oplog stream.
+
+### Verified Results (2026-07-23, tag `om-20260723-183000`, primary-sourced)
+
+| Metric | Value |
+|---|---|
+| Tailer + cursor node | **primary `aen-mongo-06`** (OM log: `checkpointingTarget` + `oplogTailTarget` = `aen-mongo-06:27017`) |
+| Post-restore (T1) | markers **`A=1 B=0`**, `loadtest` at T1 (drift 0) |
+| Post-replay (T2) | markers **`A=1 B=1`** — marker B recovered forward |
+| Deterministic proof | B absent at T1 → present at T2 confirms the primary-sourced stream captured & replayed the post-snapshot write |
+
+> The 2026-07-23 run's load generator was idle (only the manual marker B and batch were post-snapshot writes), so
+> marker B is the headline proof. A prior RS PIT run with a live bulk delta (2026-06-11, tag `om-20260611-150821`:
+> T1=8,000 → T2=11,000) achieved the count-based **`unrecoveredTail=0`** — together they cover both the
+> deterministic and the throughput cases.
 
 ### Re-baseline + zero-tail forward PITR (2026-06-08, tag `om-20260608-165149`)
 
