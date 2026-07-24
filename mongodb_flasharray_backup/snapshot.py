@@ -321,7 +321,7 @@ def _run(
         config.write_host("  Full snapshot requested.", fg=config.CYAN)
         # endregion
 
-        # region --- STEP 3: Create and start the snapshot job ---
+        # region --- STEP 3: Quiesce balancer (sharded) + create & start the snapshot job ---
         config.write_host("\n=== STEP 3: Creating snapshot job ===", fg=config.YELLOW)
 
         # Audit log: every snapshot run is captured to a transcript file.
@@ -333,20 +333,16 @@ def _run(
         # Reset the duration timer here, after the transcript is open, so it measures the actual snapshot work.
         Start = datetime.now()
 
-        CreateResponse = config.invoke_om_api(
-            method="POST",
-            path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/snapshot",
-            body=SnapshotBody,
-        )
-        SnapshotId = CreateResponse.get("snapshotId")
-        config.write_host(f"  Snapshot job created: {SnapshotId}", fg=config.GREEN)
-
-        # region --- STEP 3.5: Quiesce the balancer before opening the cursor (sharded only) ---
+        # region --- STEP 3a: Quiesce the balancer (sharded only) — BEFORE creating the job ---
         # $backupCursor is a per-node checkpoint pin — it does NOT pause chunk migrations. Because each
         # shard is snapshotted independently, an in-flight migration during the FA snapshots can capture a
         # chunk on both/neither shard, or leave shard data disagreeing with the config metadata. Stop the
-        # balancer (sh.stopBalancer drains any in-progress round) before /start, and restore the prior
-        # state in the outer finally. Replica sets have no balancer, so this is skipped there.
+        # balancer (sh.stopBalancer drains any in-progress round) and restore the prior state in the outer
+        # finally. Replica sets have no balancer, so this is skipped there.
+        #
+        # This runs BEFORE the OM snapshot job is created so that a stop failure/timeout aborts with NO
+        # job in existence — otherwise a created-but-never-started job would linger and its PENDING state
+        # could trip the next run's STEP 0 pre-flight ("job already in progress").
         MongosUri = f"mongodb://{cfg.MongosHost}:{cfg.MongosPort}"
         if cfg.Topology == "sharded" and not skip_balancer_stop:
             config.write_host(
@@ -389,6 +385,15 @@ def _run(
                 fg=config.YELLOW,
             )
         # endregion
+
+        # region --- STEP 3b: Create and start the snapshot job (opens $backupCursor) ---
+        CreateResponse = config.invoke_om_api(
+            method="POST",
+            path=f"group/{cfg.GroupId}/clusters/{cfg.ClusterId}/snapshot",
+            body=SnapshotBody,
+        )
+        SnapshotId = CreateResponse.get("snapshotId")
+        config.write_host(f"  Snapshot job created: {SnapshotId}", fg=config.GREEN)
 
         config.write_host("  Starting snapshot (opens $backupCursor on each node)...", fg=config.CYAN)
         config.invoke_om_api(

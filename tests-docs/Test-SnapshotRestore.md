@@ -1,12 +1,12 @@
 # Test: Snapshot and Restore
 
 Validates the end-to-end snapshot and restore flow for both deployments: the `aen-cluster` sharded cluster
-(Tests 1–5) and the `aen-rs-00` standalone replica set (Tests 6–7).
+(Tests 1–5, 8) and the `aen-rs-00` standalone replica set (Tests 6–7).
 
 > **Replica-set deployments:** the same procedure applies to a standalone replica set — append
 > `--deployment aen-rs-00` to every command and point `mongosh` at an RS member instead of `mongos`. Fully worked
-> RS runs are in **Test 6** (self-restore, fidelity proof) and **Test 7** (PIT with A/B markers) below; Tests 1–3
-> and 4–5 use the sharded `aen-cluster`.
+> RS runs are in **Test 6** (self-restore, fidelity proof) and **Test 7** (PIT with A/B markers) below; Tests 1–5
+> and 8 use the sharded `aen-cluster` (Test 8 checks the balancer quiesce/restore).
 
 > **Run each step manually in separate terminals.** Multi-stage workflows that combine a long-running background process (e.g. `start-insert-load`) with a foreground operation (e.g. `new-mongo-snapshot`) in the same pipeline will deadlock — the parent shell waits for stdout to drain before reading the next pipe stage, and both sides block. Each process must run in its own independent terminal with no shared pipe.
 
@@ -604,6 +604,86 @@ confirm B is recovered (`A=1 B=1`) with the same `rs '…marks…'` eval.
 > marker B is the headline proof. A prior RS PIT run with a live bulk delta (2026-06-11, tag `om-20260611-150821`:
 > T1=8,000 → T2=11,000) achieved the count-based **`unrecoveredTail=0`** — together they cover both the
 > deterministic and the throughput cases.
+
+---
+
+## Test 8 — Sharded snapshot quiesces the balancer
+
+`$backupCursor` does **not** pause chunk migrations, so `new-mongo-snapshot` stops the balancer for the
+duration of a **sharded** snapshot and restores its prior state afterward (see
+[../docs/how-it-works.md](../docs/how-it-works.md) → "It does not pause the balancer"). This test confirms the
+stop → snapshot → restore cycle, and that an **in-flight migration is waited out** (not aborted) before the
+cursor opens. Replica sets have no balancer; this test is sharded-only.
+
+The stop/restore happens automatically inside `new-mongo-snapshot` — there are no extra flags to pass. Use the
+`mongos()` helper from the session-setup block.
+
+### Steps
+
+**1. Confirm the balancer is enabled and note its state.**
+
+```bash
+mongos 'print("balancerEnabled="+sh.getBalancerState())'
+```
+
+**2. (Optional — the in-progress-migration case) create movement so a round is likely mid-flight.**
+Skip if the cluster is balanced. Otherwise nudge the balancer to have work to do (e.g. after a data load or
+`addShard`) and leave it running, then immediately start the snapshot in step 3.
+
+**3. Take a snapshot and watch the balancer lines.**
+
+```bash
+new-mongo-snapshot --deployment aen-cluster --snapshot-tag "om-20260724-020000"
+```
+
+Watch STEP 3 of the output — it should print, in order:
+```
+  Quiescing balancer before opening the backup cursor (sharded)...
+  Balancer stopped (prior state: enabled); no in-flight migration.
+  ...
+  Starting snapshot (opens $backupCursor on each node)...
+```
+and, at the end, from the outer cleanup:
+```
+  Balancer re-enabled (restored prior state).
+```
+
+**4. Confirm the balancer is back to its prior state.**
+
+```bash
+mongos 'print("balancerEnabled="+sh.getBalancerState())'
+```
+
+**5. (Override case) confirm `--skip-balancer-stop` bypasses the stop.**
+
+```bash
+new-mongo-snapshot --deployment aen-cluster --snapshot-tag "om-20260724-020500" --skip-balancer-stop
+```
+Output should print the `WARNING: --skip-balancer-stop set …` line and **no** balancer stop/restore.
+
+### Expected Results
+
+- The snapshot **quiesces the balancer before creating/starting the OM job** (the quiesce runs *ahead* of job
+  creation, so a stop failure aborts with no dangling job) and **re-enables it** in the final cleanup — but only
+  if it was enabled to begin with (a cluster that was already balancer-off is left off).
+- If a migration is in progress when the snapshot starts, `sh.stopBalancer(300000, 1000)` **blocks until the
+  in-flight round drains** (up to 5 min) — the migration finishes gracefully, it is not aborted — and only then
+  is the `$backupCursor` opened. The snapshot simply takes longer; it does not fail.
+- If the balancer cannot be confirmed stopped (e.g. the migration does not drain within the timeout, or mongos
+  is unreachable), the run **fails loud with no OM job created** and the balancer is left as found. `RESULT:`
+  the fix is to retry when the cluster is quieter, or pass `--skip-balancer-stop` (unsafe).
+- Step 4 returns the **same** `balancerEnabled` value as step 1.
+
+### Verified Results (2026-07-24, tag `om-20260724-020000`)
+
+| Metric | Value |
+|---|---|
+| Balancer state before | `true` (enabled) |
+| Snapshot log | `Balancer stopped (prior state: enabled); no in-flight migration.` → snapshot → `Balancer re-enabled (restored prior state).` |
+| Balancer state after | `true` (restored) |
+| Snapshot | `om-20260724-020000` completed (all 4 arrays) |
+
+---
 
 ### Re-baseline + zero-tail forward PITR (2026-06-08, tag `om-20260608-165149`)
 
