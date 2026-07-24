@@ -7,6 +7,10 @@ standalone replica set** using Pure Storage FlashArray, **Pure Storage Fusion**,
 A single `.env` can describe **multiple deployments** (e.g. a sharded cluster *and* a standalone replica set);
 pick one per run with `--deployment <name>`. See [Configure](#configure).
 
+> **New here / taking this over?** Start with **[HANDOFF.md](HANDOFF.md)** — lab/cluster/VM requirements and
+> reference architecture — then [GETTING-STARTED.md](GETTING-STARTED.md) for install/config. To run the full
+> test + certification suites with a Claude agent, see **[docs/AGENT-TESTING.md](docs/AGENT-TESTING.md)**.
+
 Each MongoDB node's data volume lives on a FlashArray, and the arrays are enrolled in a Pure Storage Fusion
 fleet. The toolkit talks to the arrays over the **FlashArray REST API**, connecting **directly to each fleet
 member** (`fa_rest.py`) and authenticating fleet-wide with a directory account (`FA_USERNAME`/`FA_PASSWORD`) so
