@@ -191,3 +191,27 @@ post-snapshot marker **B** in `pitrtest.marks` (PIT).
 **Verdict:** all in-scope, live-runnable certification tests pass on the primary-sourced implementation —
 RS + sharded self-restore (drift 0, fidelity proven) and RS + sharded PIT (`unrecoveredTail=0`, marker B
 recovered).
+
+---
+
+## Full Test-SnapshotRestore.md run (2026-07-24) — Tests 1–7 all PASS
+
+Ran every test in [Test-SnapshotRestore.md](Test-SnapshotRestore.md) end-to-end (build `main` @ `1b88fc0`),
+both deployments healthy throughout (`aen-cluster` 10/10, `aen-rs-00` 3/3). The load generator (`start-insert-load`)
+proved very fast (~1–2 k docs/s), giving wide but correct consistency windows.
+
+| # | Test | Deployment | Tag | Result |
+|---|---|---|---|---|
+| 1 | Basic restore (no load) | `aen-cluster` | `om-20260724-000001` | ✅ drop → restore → **51,600/20,000 drift 0** |
+| 2 | Restore under load | `aen-cluster` | `om-20260724-000002` | ✅ post-restore `loadtest` **174,600 ∈ [173,927, 174,800]** (drift 873); post-snapshot writes (→203,800) correctly lost |
+| 3 | PITR under load | `aen-cluster` | `om-20260724-000003` | ✅ restore→T1 **274,800 ∈ [273,800, 275,000]**; replay-all→T2 **319,600 `unrecoveredTail=0`** across all shards |
+| 4 | Self-restore fidelity | `aen-cluster` | `om-20260724-000004` | ✅ mutate (0/0 + sentinel) → restore → **319,600/20,000 drift 0, sentinel gone**; per-shard 213,250+106,350=319,600 |
+| 5 | PIT with A/B markers | `aen-cluster` | `om-20260724-000005` | ✅ restore→T1 `A=1 B=0` (drift 0); replay→T2 `A=1 B=1`, `loadtest` **321,600 `unrecoveredTail=0`** |
+| 6 | RS self-restore fidelity | `aen-rs-00` | `om-20260724-000006` | ✅ mutate (0/0 + sentinel) → restore → **17,000/5,000 drift 0, sentinel gone** |
+| 7 | RS PIT with A/B markers | `aen-rs-00` | `om-20260724-000007` | ✅ restore→T1 `A=1 B=0` (drift 0); replay→T2 `A=1 B=1`, `loadtest` **19,000 `unrecoveredTail=0`** |
+
+**Notes:** Tests 3, 5, 7 each required a **skip-forward re-baseline** of the (stale) oplog cursor before the run —
+routine given the intermittent tailing between tests; each re-baseline landed the cursor ~150–220 s behind now. All
+tailers/cursors selected the **PRIMARY** per shard/RS. Both clusters left healthy; no leftover load/tailer
+processes. This exercises the same paths as the 2026-07-23 cert sweep plus the under-load (Tests 2–3) and
+no-load-drop (Test 1) variants.
