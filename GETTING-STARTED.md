@@ -10,7 +10,7 @@ understand *why* it's crash-consistent? See [docs/how-it-works.md](docs/how-it-w
 > **The 30-second mental model:** Ops Manager opens a `$backupCursor` on the primary of each replica set
 > (each shard, or the single RS — pinning a consistent point), and while it's held, the tool takes a
 > FlashArray protection-group snapshot on every array at once. Restore overwrites each node's volume from that
-> snapshot in place; WiredTiger crash-recovers on restart. No `fsyncLock`, no write stall.
+> snapshot in place; WiredTiger crash-recovers on restart. No `fsyncLock`, no write stall. Also, it is required that a node and all of its volumes are wholly contained within a single array. A node's volumes cannot span multiple arrays.
 
 ---
 
